@@ -74,7 +74,8 @@ type fakeCatalog struct {
 	asked  []string
 }
 
-func (c *fakeCatalog) Owns(link string) bool { return strings.HasPrefix(link, c.prefix) }
+func (c *fakeCatalog) Owns(link string) bool     { return strings.HasPrefix(link, c.prefix) }
+func (c *fakeCatalog) Key(string) (string, bool) { return "", false }
 
 func (c *fakeCatalog) Track(_ context.Context, link string) (Track, error) {
 	c.asked = append(c.asked, link)
@@ -366,5 +367,115 @@ func TestYandexMusic(t *testing.T) {
 		if y.Owns(link) != want {
 			t.Errorf("Owns(%s) = %v", link, !want)
 		}
+	}
+}
+
+func TestCatalogKeys(t *testing.T) {
+	spotify, apple := NewSpotify(nil, SpotifySite), NewAppleMusic(nil, AppleAPI)
+	deezer, yandex := NewDeezer(nil, DeezerAPI), NewYandexMusic(nil, YandexAPI)
+	tests := []struct {
+		c    Catalog
+		link string
+		want string // empty for no key
+	}{
+		{spotify, "https://open.spotify.com/track/4iZ4pt7kvcaH6Yo8UoZ4s2?si=abc", "spotify:4iZ4pt7kvcaH6Yo8UoZ4s2"},
+		{spotify, "https://open.spotify.com/intl-de/track/4iZ4pt7kvcaH6Yo8UoZ4s2?si=xyz", "spotify:4iZ4pt7kvcaH6Yo8UoZ4s2"},
+		{spotify, "https://spotify.link/aBcDeFgHiJ", ""},
+		{spotify, "https://open.spotify.com/album/4iZ4pt7kvcaH6Yo8UoZ4s2", ""},
+		{apple, "https://music.apple.com/us/album/snooze/1655268023?i=1655268385&uo=4", "apple:us:1655268385"},
+		{apple, "https://music.apple.com/us/song/snooze/1655268385", "apple:us:1655268385"},
+		{apple, "https://music.apple.com/gb/song/snooze/1655268385", "apple:gb:1655268385"},
+		{apple, "https://music.apple.com/us/album/sos/1655268023", ""},
+		{deezer, "https://www.deezer.com/en/track/2047662537?utm_source=share", "deezer:2047662537"},
+		{deezer, "https://deezer.com/track/2047662537", "deezer:2047662537"},
+		{deezer, "https://deezer.page.link/aBcD", ""},
+		{yandex, "https://music.yandex.ru/album/22962015/track/105922651", "yandex:105922651"},
+		{yandex, "https://music.yandex.com/track/105922651?utm_source=share", "yandex:105922651"},
+		{yandex, "https://music.yandex.ru/album/22962015", ""},
+	}
+	for _, tt := range tests {
+		got, ok := tt.c.Key(tt.link)
+		if ok != (tt.want != "") || got != tt.want {
+			t.Errorf("Key(%s) = %q, %v; want %q", tt.link, got, ok, tt.want)
+		}
+	}
+}
+
+// spotifyLike is a fakeCatalog that names songs as Spotify does.
+type spotifyLike struct{ *fakeCatalog }
+
+func (spotifyLike) Key(link string) (string, bool) { return (&Spotify{}).Key(link) }
+
+func TestOneSongAcrossItsLinks(t *testing.T) {
+	cat := spotifyLike{&fakeCatalog{prefix: "https://", track: Track{
+		Link: "https://open.spotify.com/track/4iZ4pt7kvcaH6Yo8UoZ4s2", Title: "Snooze", Artists: []string{"SZA"}, Length: 202 * time.Second,
+	}}}
+	music := &fakeSearch{found: []songs.Song{{ID: "LDY_XyxBu8A", Link: songs.WatchLink("LDY_XyxBu8A"), Title: "Snooze", Artist: "SZA", Length: 202 * time.Second}}}
+	yt := &fakeLookup{song: songs.Song{ID: "LDY_XyxBu8A", Audio: songs.Audio{URL: "audio", Expires: time.Now().Add(6 * time.Hour)}}}
+	var shared []string
+	f := &Finder{youtube: yt, music: music, catalogs: []Catalog{cat}}
+	f.Search = func(ctx context.Context, query string) ([]songs.Song, error) {
+		shared = append(shared, query)
+		return music.found, nil
+	}
+
+	// Two people share the same song: their links differ in Spotify's si=.
+	for _, link := range []string{
+		"https://open.spotify.com/track/4iZ4pt7kvcaH6Yo8UoZ4s2?si=abc",
+		"https://open.spotify.com/track/4iZ4pt7kvcaH6Yo8UoZ4s2?si=xyz",
+	} {
+		if _, err := f.Find(context.Background(), link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(cat.asked) != 1 || len(shared) != 1 {
+		t.Errorf("asked Spotify %d times and searched %d times for two links to one song, want once", len(cat.asked), len(shared))
+	}
+	if len(music.asked) != 0 {
+		t.Errorf("searched YouTube Music itself %d times, want the shared search", len(music.asked))
+	}
+
+	// A short link has to be followed, but then it's the same song.
+	if _, err := f.Find(context.Background(), "https://spotify.link/aBcDeFgHiJ"); err != nil {
+		t.Fatal(err)
+	}
+	if len(cat.asked) != 2 || len(shared) != 1 || len(yt.asked) != 1 {
+		t.Errorf("a short link: asked Spotify %d times, searched %d and looked up %d; want 2, 1 and 1", len(cat.asked), len(shared), len(yt.asked))
+	}
+}
+
+func TestAppleStoresStayApart(t *testing.T) {
+	// The store's answer links the song in the US store even when it was
+	// asked about Azerbaijan's: that mustn't answer for the US store.
+	var countries []string
+	client := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+		country := r.URL.Query().Get("country")
+		countries = append(countries, country)
+		body := `{"resultCount": 0, "results": []}`
+		if country == "az" {
+			body = appleSnooze
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	music := &fakeSearch{found: []songs.Song{{ID: "LDY_XyxBu8A", Link: songs.WatchLink("LDY_XyxBu8A"), Title: "Snooze", Artist: "SZA", Length: 202 * time.Second}}}
+	yt := &fakeLookup{song: songs.Song{ID: "LDY_XyxBu8A", Audio: songs.Audio{URL: "audio", Expires: time.Now().Add(6 * time.Hour)}}}
+	f := &Finder{youtube: yt, music: music, catalogs: []Catalog{NewAppleMusic(client, "https://apple.invalid")}}
+	if _, err := f.Find(context.Background(), "https://music.apple.com/az/song/snooze/1658650499"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Find(context.Background(), "https://music.apple.com/us/song/snooze/1658650499"); !errors.Is(err, songs.ErrUnplayable) {
+		t.Errorf("the US store's link = %v, want it asked, and not there; asked %v", err, countries)
+	}
+}
+
+func TestCatalogsWaitOutABotCheck(t *testing.T) {
+	cat := spotifyLike{&fakeCatalog{prefix: "https://", track: Track{
+		Link: "https://open.spotify.com/track/4iZ4pt7kvcaH6Yo8UoZ4s2", Title: "Snooze", Artists: []string{"SZA"}, Length: 202 * time.Second,
+	}}}
+	music := &fakeSearch{found: []songs.Song{{ID: "LDY_XyxBu8A", Link: songs.WatchLink("LDY_XyxBu8A"), Title: "Snooze", Artist: "SZA", Length: 202 * time.Second}}}
+	f := &Finder{music: music, catalogs: []Catalog{cat}, checked: time.Now()}
+	f.FindAhead(context.Background(), cat.track.Link)
+	if len(music.asked) != 0 {
+		t.Errorf("searched YouTube Music %d times ahead, during a bot check", len(music.asked))
 	}
 }

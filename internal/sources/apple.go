@@ -46,6 +46,40 @@ func (a *AppleMusic) Owns(link string) bool {
 	return false
 }
 
+// Key names a song by its store's country and its ID: a song can be in one
+// country's store and not another's.
+func (a *AppleMusic) Key(link string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(link))
+	if err != nil {
+		return "", false
+	}
+	country, id, list := appleSong(u)
+	if list || !appleID.MatchString(id) {
+		return "", false
+	}
+	return "apple:" + country + ":" + id, true
+}
+
+// appleSong reads a link's country, "us" if it doesn't say, and its song's
+// ID: a song's own, or the one an album link picks with ?i=. list is set for
+// an album or a playlist without one.
+func appleSong(u *url.URL) (country, id string, list bool) {
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	country = "us"
+	if len(parts) > 0 && appleCountry.MatchString(parts[0]) {
+		country, parts = parts[0], parts[1:]
+	}
+	id = u.Query().Get("i")
+	switch {
+	case len(parts) == 0:
+	case id == "" && (parts[0] == "song" || parts[0] == "music-video"):
+		id = parts[len(parts)-1]
+	case id == "" && (parts[0] == "album" || parts[0] == "playlist"):
+		return country, "", true
+	}
+	return country, id, false
+}
+
 // Track finds the song at an Apple Music link: an album's link with ?i= for
 // one of its songs, or a song's own link.
 func (a *AppleMusic) Track(ctx context.Context, link string) (Track, error) {
@@ -53,17 +87,8 @@ func (a *AppleMusic) Track(ctx context.Context, link string) (Track, error) {
 	if err != nil {
 		return Track{}, err
 	}
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	country := "us"
-	if len(parts) > 0 && appleCountry.MatchString(parts[0]) {
-		country, parts = parts[0], parts[1:]
-	}
-	id := u.Query().Get("i")
-	switch {
-	case len(parts) == 0:
-	case id == "" && (parts[0] == "song" || parts[0] == "music-video"):
-		id = parts[len(parts)-1]
-	case id == "" && (parts[0] == "album" || parts[0] == "playlist"):
+	country, id, list := appleSong(u)
+	if list {
 		return Track{}, fmt.Errorf("apple music %s: %w", link, songs.ErrPlaylist)
 	}
 	if !appleID.MatchString(id) {

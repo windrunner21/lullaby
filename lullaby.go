@@ -50,13 +50,37 @@ const (
 	suggestedFor = 15 * time.Minute
 	// maxSuggested is how many suggestions are remembered at most.
 	maxSuggested = 500
-	// searchedFor is how long a search's results are reused for the same words.
+	// searchedFor is how long a search's results are reused for the same
+	// words, unless Config.SearchMemory says otherwise.
 	searchedFor = 10 * time.Minute
-	// maxSearched is how many searches are remembered at most.
-	maxSearched = 300
+	// emptyFor is how long a search that found nothing is believed, however
+	// long others are kept.
+	emptyFor = time.Minute
+	// maxSearched is how many searches are remembered at most. Every
+	// keystroke's words are one, and one of 20 songs takes about 10 KB, so
+	// a full memory is about 10 MB.
+	maxSearched = 1000
 	// searchTimeout is the longest a search may take, even with nobody
 	// waiting for it anymore.
 	searchTimeout = 10 * time.Second
+	// settleAfter is how long someone has stopped typing before the first
+	// song suggested to them is looked up: long enough that a fast typist's
+	// keystrokes don't each cost a lookup, short enough that it's ready
+	// before they've picked it.
+	settleAfter = 300 * time.Millisecond
+	// maxLookAhead, maxLookAheadDay and maxLookingAhead bound the early
+	// lookups that ask YouTube: in an hour, in a day, and at once. They're
+	// far more than friends typing songs need, so only a runaway, like a
+	// script typing, meets them, and then songs are looked up when they're
+	// played, as without early lookups. Each asks YouTube once, or twice for
+	// a catalog's song: its search and its lookup.
+	maxLookAhead    = 60
+	maxLookAheadDay = 300
+	maxLookingAhead = 2
+	// maxTypists is how many typists' last keystrokes are remembered; ones
+	// idle for typistIdle are forgotten to make room.
+	maxTypists = 64
+	typistIdle = 2 * time.Minute
 	// touchEvery is how often someone typing warms up YouTube's API.
 	touchEvery = time.Minute
 	// minNarrowed is how many songs an earlier search, narrowed down to the
@@ -130,6 +154,17 @@ type Config struct {
 	// Links handed to yt-dlp, or to ffmpeg to read itself, are checked
 	// first, but those programs resolve and follow redirects on their own.
 	AllowPrivateLinks bool
+
+	// SearchMemory is how long what a search found is reused for the same
+	// words, and narrowed down for longer ones. Zero is 10 minutes. A bot
+	// whose listeners play the same songs again can keep searches for a day:
+	// typing a song again then suggests it at once, without asking YouTube
+	// Music, which takes about half a second, though a day-old search may
+	// miss a song released since. Only the same words are answered from a
+	// longer memory: an earlier search narrowed down for longer words is 10
+	// minutes old at most. It doesn't change how long found songs' audio
+	// links are reused, which goes by when they expire.
+	SearchMemory time.Duration
 }
 
 // noEvents hears nothing, for an Engine without Config.Events.
@@ -280,6 +315,8 @@ type Engine struct {
 	// guardLinks keeps links handed to ffmpeg off the private network. It's
 	// on unless Config.AllowPrivateLinks.
 	guardLinks bool
+	// searchFor is Config.SearchMemory; zero is searchedFor.
+	searchFor time.Duration
 
 	mu        sync.Mutex
 	ctx       context.Context // the app's lifetime, from Start: music stops with it
@@ -288,6 +325,11 @@ type Engine struct {
 	suggested map[string]suggestion        // by link
 	searched  map[string]search            // by searchKey
 	searching map[string]*searching        // searches on their way, by searchKey
+	typing    map[typist]*typing           // each typist's last keystroke
+	// lookedAhead is when the early lookups in the last day asked YouTube,
+	// and lookingAhead how many are asking now.
+	lookedAhead  []time.Time
+	lookingAhead int
 	// leaving is closed once a server's old voice connection is gone.
 	leaving map[snowflake.ID]chan struct{}
 	// spare is an ffmpeg started while someone types, for their song.
@@ -375,7 +417,7 @@ func New(cfg Config) (*Engine, error) {
 	finder := sources.NewFinder(yt, sc, dl, signedIn, catalogs...)
 	finder.Logger = logger
 	finder.GuardLinks = !cfg.AllowPrivateLinks
-	return &Engine{
+	e := &Engine{
 		ffmpeg:     ffmpeg,
 		http:       client,
 		yt:         yt,
@@ -386,6 +428,7 @@ func New(cfg Config) (*Engine, error) {
 		events:     events,
 		log:        logger,
 		guardLinks: !cfg.AllowPrivateLinks,
+		searchFor:  max(cfg.SearchMemory, 0),
 		ctx:        context.Background(),
 		players:    make(map[snowflake.ID]*player),
 		turns:      make(map[snowflake.ID]*sync.Mutex),
@@ -393,7 +436,10 @@ func New(cfg Config) (*Engine, error) {
 		searched:   make(map[string]search),
 		searching:  make(map[string]*searching),
 		leaving:    make(map[snowflake.ID]chan struct{}),
-	}, nil
+	}
+	// A Spotify song's search is remembered like anyone's typed one.
+	finder.Search = e.search
+	return e, nil
 }
 
 // logger is where the engine logs: Config.Logger, or slog's default for an

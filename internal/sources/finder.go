@@ -46,6 +46,10 @@ type Finder struct {
 	// GuardLinks refuses other sites' links on the bot host's own network
 	// before yt-dlp fetches them.
 	GuardLinks bool
+	// Search, if set, is how catalogs' songs are searched for on YouTube
+	// Music, like through the engine's searches, which are shared and
+	// remembered. Nil asks YouTube Music each time.
+	Search func(ctx context.Context, query string) ([]songs.Song, error)
 
 	youtube    lookup // by video ID
 	soundcloud lookup
@@ -101,6 +105,15 @@ func (f *Finder) Find(ctx context.Context, link string) (songs.Song, error) {
 	return f.lookup(ctx, link, false)
 }
 
+// Knows reports whether the song at link is remembered, so finding it asks
+// nobody.
+func (f *Finder) Knows(link string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.recallLocked(f.key(link))
+	return ok
+}
+
 // FindAhead looks up the song at link while someone is still choosing it, so
 // Find finds it ready. It only takes the fast ways, never yt-dlp, and leaves
 // YouTube alone during a bot check: a lookup nobody ends
@@ -112,10 +125,7 @@ func (f *Finder) FindAhead(ctx context.Context, link string) {
 }
 
 func (f *Finder) lookup(ctx context.Context, link string, ahead bool) (songs.Song, error) {
-	key := link
-	if id, ok := songs.YouTubeID(link); ok {
-		key = songs.WatchLink(id) // so youtu.be and youtube.com links are one song
-	}
+	key := f.key(link)
 	f.mu.Lock()
 	if song, ok := f.recallLocked(key); ok {
 		f.mu.Unlock()
@@ -220,6 +230,23 @@ func (f *Finder) find(ctx context.Context, link string, ahead bool) (songs.Song,
 		}
 	}
 	return f.ytdlp.Lookup(ctx, link)
+}
+
+// key is how the song at link is remembered: the same for every link to it,
+// like youtu.be and youtube.com links, or two shares of a Spotify song.
+func (f *Finder) key(link string) string {
+	if id, ok := songs.YouTubeID(link); ok {
+		return songs.WatchLink(id)
+	}
+	for _, c := range f.catalogs {
+		if c.Owns(link) {
+			if key, ok := c.Key(link); ok {
+				return key
+			}
+			break
+		}
+	}
+	return link
 }
 
 // botChecked reports whether YouTube made a bot check within botCheckFor.

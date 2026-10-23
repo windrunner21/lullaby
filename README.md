@@ -16,7 +16,7 @@ lullaby runs in Rem's Little Helper, a Discord bot, on a Raspberry Pi 5, and was
 ## Features
 
 - **Songs from a name or a link.** A name is searched on YouTube Music. Links can be from YouTube, SoundCloud, Spotify, Apple Music, Deezer or Yandex Music. The last four don't give bots their songs, so lullaby reads the song's name, artists and length there, and plays the same song from YouTube Music, with the original's cover.
-- **Suggestions while someone types:** from memory, from an earlier search narrowed down to the words typed since, or from YouTube Music. Picking one plays it with YouTube Music's title, artist and cover.
+- **Suggestions while someone types:** from memory, from an earlier search narrowed down to the words typed since, or from YouTube Music. Searches can be remembered for as long as you like, so a song typed again is suggested at once. Once they stop typing, the engine tries to look the first song up, within a budget, so picking it or pressing Enter can play it at once. Picking one plays it with YouTube Music's title, artist and cover.
 - **A queue in every server, without gaps.** The next song is ready, with its ffmpeg running, before the one playing ends, and takes over in the same 20 ms. A song can go to the front of the queue. Pause, skip and stop act at once.
 - **Ready before Enter.** While someone is still typing, lullaby can join their voice channel, warm up the connection to YouTube, start an ffmpeg and look up a pasted link.
 - **A backup.** With [yt-dlp](https://github.com/yt-dlp/yt-dlp), links from other sites play too, and yt-dlp takes over when YouTube or SoundCloud change something. During a YouTube bot check, it can sign in with a spare account.
@@ -47,6 +47,21 @@ You need Go 1.26 or newer, disgo v0.19.6, and [ffmpeg](https://ffmpeg.org), whic
 The backup is optional: [yt-dlp](https://github.com/yt-dlp/yt-dlp#installation), with [Bun](https://bun.sh) up to 1.3.14 to run YouTube's JavaScript, since yt-dlp doesn't support newer Bun yet (`curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14"`). Without them, everything plays but other sites' links, with no backup.
 
 lullaby is tested on Linux. On systems other than Unix, stopping yt-dlp may leave the programs it started running.
+
+### A lean ffmpeg
+
+Every song goes through ffmpeg, and a distribution's ffmpeg is built for everything ffmpeg can do: Debian's loads 213 libraries, for video, hardware and formats no song comes in, before it starts encoding. That costs about 95 ms each time one starts and 23 MB for each one waiting, and lullaby keeps up to three running at once.
+
+`make ffmpeg` builds one with only what lullaby uses: the audio formats songs come in, the Opus encoder, and the protocols lullaby passes ffmpeg, in one static 8 MB file with nothing to load. It's cross-compiled with [zig](https://ziglang.org) from pinned, checksummed sources, so any Linux machine can build it for any other: `bin/ffmpeg-linux-arm64` for a Raspberry Pi, or `TARGET=x86_64-linux-musl make ffmpeg` for amd64. Point `Config.FFmpeg` at it. On a Raspberry Pi 5:
+
+| | Debian's | lean |
+|---|---|---|
+| Starting | 95 ms | 0.2 ms |
+| Memory waiting, as the spare | 23 MB | 1.1 MB |
+| Memory while playing | 45 MB | 7.3 MB |
+| CPU for a song | 5.9 s | 4.5 s |
+
+It plays AAC, MP3, Opus, Vorbis, FLAC, ALAC, AC-3 and PCM, in MP4, WebM, Matroska, Ogg, MPEG-TS and HLS playlists, and trusts the system's certificates for https, as a distribution's does. A song in anything else won't play; add its decoder and container to the script. It gets no security updates by itself: build it again when ffmpeg or OpenSSL releases a fix. [BENCHMARKS.md](BENCHMARKS.md#a-lean-ffmpeg) has the measurements and how to repeat them, and [CONTRIBUTING.md](CONTRIBUTING.md#things-to-know) why it's built as it is.
 
 ## Quick start
 
@@ -82,7 +97,8 @@ track, place, err := music.Play(ctx, lullaby.Request{GuildID: guildID, ChannelID
 |---|---|
 | `New(Config)`, `Start(ctx)` | Make the engine, then start it, once, with your bot's lifetime. When `ctx` is done, the engine stops the music in every server and leaves voice |
 | `Play(ctx, Request)` | Joins the voice channel, finds the song and starts ffmpeg all at once, or puts the song in the queue. Returns the `*Track` and its place in line, 0 when it plays now. `ctx` only bounds the wait: the song plays on after `Play` returns. Once the engine is in voice in a server, it stays in its channel, so check who may ask before you call `Play` |
-| `Suggest(ctx, words)` | Songs for autocomplete, at most `MaxSuggestions`. A link gets none, and is looked up ahead instead |
+| `SuggestFor(ctx, SuggestRequest{GuildID, UserID, Query})` | Songs for autocomplete, at most `MaxSuggestions`. Once that person stops typing, the first is looked up if the budget allows. A link gets none, and is looked up ahead instead |
+| `Suggest(ctx, words)` | `SuggestFor` without saying who's typing, so everyone's keystrokes replace each other's early lookups |
 | `JoinEarly`, `GetReady` | Get ready for someone typing: join their channel, warm up YouTube, start an ffmpeg |
 | `Pause`, `Skip`, `Stop`, `StopSong` | Control the music. `StopSong` stops only while a given song plays, so an old song's buttons can't stop a newer one |
 | `Playing`, `UpNext`, `Channel` | What's playing, what's next and how many after it, and where |
@@ -92,7 +108,7 @@ A `Track` is one song: `Song()` gives its title, artist, length and link, `Playe
 
 Your `Events` hear what happens: `Started` when a song from the queue starts by itself, `Ended` when one is over by itself or skipped (with who skipped it, or why it broke off), `Left` when the engine leaves voice by itself, after nothing played or a song stayed paused for a while, and `QueueChanged` when a song that won't start is passed over. A song you stop isn't told about: `Stop` and `Disconnected` return it. The engine never calls events while holding its own lock, so they may call it back, and your bot may call the engine while holding a lock its events take. They can run at the same time, for different servers or for one.
 
-What the engine hands you is yours: `Song()`, `UpNext` and `Suggest` return copies. Errors and logs have the links in them redacted, since a link's query can hold a token.
+What the engine hands you is yours: `Song()`, `UpNext`, `Suggest` and `SuggestFor` return copies. Errors and logs have the links in them redacted, since a link's query can hold a token.
 
 The engine leaves a channel 2 minutes after the music stops, 30 seconds after `JoinEarly` if no song comes, and after a song has been paused for 10 minutes. A queue holds up to `MaxQueue` (100) songs.
 
@@ -110,6 +126,7 @@ The engine leaves a channel 2 minutes after the music stops, 30 seconds after `J
 | `Cache` | where yt-dlp keeps what it learned about YouTube's JavaScript | yt-dlp's own |
 | `Cookies` | a spare YouTube account's `cookies.txt`, for bot checks; needs `YTDLP` | never signing in |
 | `AllowPrivateLinks` | let songs come from the bot host's own network, like a music server at home; see below | off |
+| `SearchMemory` | how long a search is reused for the same words, up to 1000 searches; one that found nothing is believed for a minute at most. A day suits friends who play the same songs again, though a day-old search may miss a new release | 10 minutes |
 
 ### Errors
 
@@ -146,9 +163,10 @@ lullaby also keeps strangers' links from costing much: yt-dlp's answer, playlist
 
 ## Tips for speed
 
-- **Call `JoinEarly` and `GetReady` from autocomplete**, with the typist's voice channel, and use `Suggest` for the choices. By the time they press Enter, the bot is in voice, ffmpeg is running, and a pasted link is found.
+- **Call `JoinEarly` and `GetReady` from autocomplete**, with the typist's voice channel, and use `SuggestFor`, with who's typing, for the choices. By the time they press Enter, the bot is in voice, ffmpeg is running, and a pasted link, or the first song suggested, is usually found.
 - **Tell Discord to wait while `Play` works, not before**: start `DeferCreateMessage` in a goroutine, call `Play`, then wait for the defer before editing the answer. Each answer to Discord can take 0.2–0.4 s, longer than finding a YouTube song. [`examples/bot`](examples/bot/main.go) does this.
-- **Keep one engine** for every server. It keeps its connections to the sites open between songs, remembers searches for 10 minutes, and shares lookups between people asking for the same song. If you pass your own `Config.HTTP`, keep its connections open for minutes, as `NewClient` does, and base it on an `*http.Transport`: with another kind of transport, lullaby has to look up each request's host itself before sending it, one more DNS lookup each time.
+- **Use a lean ffmpeg** (above): it starts in 0.2 ms rather than about 95 ms, which shows wherever a song gets an ffmpeg that wasn't started ahead, and each ffmpeg running takes a sixth of the memory or less.
+- **Keep one engine** for every server. It keeps its connections to the sites open between songs, remembers searches (10 minutes, or `SearchMemory`), and shares lookups between people asking for the same song. If you pass your own `Config.HTTP`, keep its connections open for minutes, as `NewClient` does, and base it on an `*http.Transport`: with another kind of transport, lullaby has to look up each request's host itself before sending it, one more DNS lookup each time.
 
 ## Keeping YouTube working
 

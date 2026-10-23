@@ -25,6 +25,11 @@ const (
 type Catalog interface {
 	// Owns reports whether link is one of the site's.
 	Owns(link string) bool
+	// Key names the song at one of the site's links without asking the
+	// site, the same for every link to it: share links differ in tracking
+	// codes like Spotify's si=. A short link can't be named until it's
+	// followed.
+	Key(link string) (string, bool)
 	// Track finds the song at link.
 	Track(ctx context.Context, link string) (Track, error)
 }
@@ -46,11 +51,35 @@ func (f *Finder) byName(ctx context.Context, c Catalog, link string, ahead bool)
 	if err != nil {
 		return songs.Song{}, err
 	}
+	// A short link is only named once it's followed: it may be a song
+	// already found through another link. A link with a name of its own
+	// keeps it, since the catalog's own link for the song can name another
+	// country's store.
+	var key string
+	var named bool
+	if _, ok := c.Key(link); !ok {
+		key, named = c.Key(t.Link)
+	}
+	if named {
+		f.mu.Lock()
+		song, ok := f.recallLocked(key)
+		f.mu.Unlock()
+		if ok {
+			return song, nil
+		}
+	}
+	if ahead && f.botChecked() {
+		return songs.Song{}, errAhead // its search would ask YouTube Music too
+	}
 	query := t.Title
 	if len(t.Artists) > 0 {
 		query = t.Artists[0] + " " + t.Title
 	}
-	found, err := f.music.Search(ctx, query)
+	search := f.music.Search
+	if f.Search != nil {
+		search = f.Search
+	}
+	found, err := search(ctx, query)
 	if err != nil {
 		return songs.Song{}, err
 	}
@@ -65,6 +94,9 @@ func (f *Finder) byName(ctx context.Context, c Catalog, link string, ahead bool)
 	song.Link, song.Title, song.Artist = t.Link, t.Title, strings.Join(t.Artists, ", ")
 	if t.Cover != "" {
 		song.Thumbnail = t.Cover
+	}
+	if named {
+		f.keep(key, song)
 	}
 	return song, nil
 }

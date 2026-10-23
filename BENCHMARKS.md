@@ -1,6 +1,6 @@
 # Benchmarks
 
-How fast lullaby plays, and how much it takes, measured on the Raspberry Pi 5 where it runs Rem's Little Helper, a Discord bot. The numbers are from 2026-10-23: two runs while lullaby was still the music engine inside that bot, and a third on lullaby's own code after its review, with the network guard, the limits and the shutdown changes in. The main comparison is with [Lavalink](https://github.com/lavalink-devs/Lavalink), the engine most Discord music bots use.
+How fast lullaby plays, and how much it takes, measured on the Raspberry Pi 5 where it runs Rem's Little Helper, a Discord bot. The numbers are from 2026-10-23: two runs while lullaby was still the music engine inside that bot, and a third on lullaby's own code after its review, with the network guard, the limits and the shutdown changes in. The main comparison is with [Lavalink](https://github.com/lavalink-devs/Lavalink), the engine most Discord music bots use. Then three ffmpeg builds, since every song goes through one: [A lean ffmpeg](#a-lean-ffmpeg).
 
 ## lullaby against Lavalink
 
@@ -129,6 +129,65 @@ Each run prints a `RESULT` line per song, the warm-up's marked `-warmup`, and a 
 
 Keep YouTube gentle: the run above asks it about 35 times. A few hundred requests in a day got the home address bot-checked for hours, and either engine stops if YouTube asks it to prove it isn't a robot.
 
+## A lean ffmpeg
+
+Every song goes through ffmpeg, which turns its audio into Opus for Discord, and lullaby keeps up to two running for each server with music, the song playing and the next one getting ready, and one spare, started while someone types. So ffmpeg is most of lullaby's memory, and starting one is on the way to the first sound whenever none was started ahead: when nobody typed first, when a song is skipped to before it's ready, and for the playlists ffmpeg reads itself, like live streams.
+
+A distribution's ffmpeg is built for everything ffmpeg can do. Debian's loads 213 shared libraries, for video, hardware and codecs no song comes in, and the system's loader fills in 44,950 addresses in them before ffmpeg runs a line of its own. `make ffmpeg` ([`scripts/build-ffmpeg.sh`](scripts/build-ffmpeg.sh)) builds one with only what lullaby uses, in one static file at a fixed address, so there's nothing to load and nothing to fill in. [CONTRIBUTING.md](CONTRIBUTING.md#things-to-know) says why it's built as it is.
+
+Measured on 2026-10-23 on the Pi:
+
+| | Debian's | Ready-made static | Lean |
+|---|---|---|---|
+| Version | 7.1.5, Debian's package | 8.1.3, [BtbN's](https://github.com/BtbN/FFmpeg-Builds) linuxarm64 LGPL build | 9.0.2, `make ffmpeg` |
+| File | 395 KB, and 213 libraries | 117 MB, and 8 of the system's libraries | 8.0 MB, nothing else |
+| Starting (`-version`) | 95 ms | 9.9 ms | **0.2 ms** |
+| First sound, started with its song | 97 ms | 14 ms | **4.0 ms** |
+| First sound, already running | 4.4 ms | 4.1 ms | **3.8 ms** |
+| Memory waiting for a song, as the spare | 23 MB | 12 MB | **1.1 MB** |
+| Three waiting at once | 70 MB | 36 MB | **3.3 MB** |
+| Memory while playing | 45 MB | 32 MB | **7.3 MB** |
+| CPU for the whole song | 5.9 s | 5.2 s | **4.5 s** |
+
+- **Starting and waiting.** Linking everything into one file, as the ready-made build does, halves the start and the memory. It still has every codec ffmpeg has, 117 MB of them, at an address picked when it starts, so the addresses in all their tables are filled in then too, and the pages they're on become its own. The lean build has neither: its start is the kernel starting a program, and three of them waiting share almost everything.
+- **Already running**, the three are within 0.7 ms of each other: encoding is the same work in each. That's why lullaby starts a spare while someone types, and with a spare waiting, the build changes the first sound by little. The memory and the CPU are every song's.
+- **CPU.** The lean build is a newer ffmpeg, linked differently; which of those saves the CPU wasn't pinned down.
+
+### What the lean build plays
+
+It has the decoders for AAC, MP3, Opus, Vorbis, FLAC, ALAC, AC-3, E-AC-3 and PCM; the containers MP4, WebM and Matroska, Ogg, MP3, raw AAC, FLAC, WAV, AC-3 and MPEG-TS; HLS playlists; Opus out, in Ogg; and the protocols pipe, file, http, https, tls, tcp and crypto, with OpenSSL for https. That's what YouTube, SoundCloud and other sites' songs come in. A song in anything else won't play: add its decoder and container to the script.
+
+Tested with a 5-second tone in each of 16 forms, made with a full ffmpeg and turned into Opus by the lean build, under emulation on an x86 machine: AAC in MP4 and raw; MP3; Opus in WebM, Ogg and Matroska; Vorbis; FLAC; ALAC; WAV; AC-3; mono AAC at 22 kHz; and HLS playlists of MPEG-TS and of fragmented MP4 pieces. Each came out as Opus of the same length. On the Pi, YouTube's AAC and Opus copies of SZA's Snooze came out whole, 280.8 and 280.7 s. An MP4 with its index at the end can't be read from a pipe, by any ffmpeg; YouTube's have it at the start.
+
+For https, which ffmpeg needs for the playlists it reads itself: a public Ogg song over https played with no certificate given, on the x86 machine and on the Pi, from each system's own certificates; an HLS playlist served over https by a test server, with its test authority trusted through `SSL_CERT_FILE`, played whole, its 6 pieces fetched over https too; and with that authority not trusted, it was refused ("certificate verify failed").
+
+### How it was measured
+
+`TestCompareFFmpeg` in [`internal/audio/compare_test.go`](internal/audio/compare_test.go) runs each ffmpeg with lullaby's own arguments, one build after another, with Rem's Little Helper running on the Pi meanwhile. The lean column is its run with the build `make ffmpeg` makes now; the ready-made build was measured earlier the same day, by the same steps. The song was YouTube's own AAC audio of [SZA, Snooze](https://www.youtube.com/watch?v=LDY_XyxBu8A) (itag 140, 4.5 MB, 4:41), saved on the Pi, so nothing was downloaded.
+
+- **Starting:** the median of 15 runs of `ffmpeg -version`.
+- **First sound:** from giving ffmpeg the song to its first Ogg page with sound in it, after the two header pages: started with its song, or 0.5 s before, as the spare is. Medians of 10.
+- **Memory** is PSS, from `/proc/<pid>/smaps_rollup`, which divides the pages processes share fairly between them: one ffmpeg waiting for its song, three at once, and one playing, given the whole song with only 200 KB of its Opus read, as lullaby reads 10 seconds ahead, so it waits mid-song.
+- **CPU:** user and system time for the whole song, encoded as fast as it goes. The median of 3.
+
+### Running it again
+
+On any Linux machine, in lullaby's folder:
+
+```sh
+make ffmpeg   # bin/ffmpeg-linux-arm64
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go test -c -o bin/audio-linux-arm64.test ./internal/audio
+```
+
+Copy both to the Pi, with a song a few minutes long, then:
+
+```sh
+LULLABY_COMPARE_FFMPEG=/usr/bin/ffmpeg,./ffmpeg-linux-arm64 LULLABY_COMPARE_SONG=song.m4a \
+  ./audio-linux-arm64.test -test.run TestCompareFFmpeg -test.v
+```
+
+It takes about a minute per build and asks no site for anything.
+
 ## Other measurements
 
 Also on the Pi, while the engine was being built inside Rem's Little Helper:
@@ -141,6 +200,9 @@ Also on the Pi, while the engine was being built inside Rem's Little Helper:
 | The engine's own memory for a 3.2 MB song | 13.4 MB, from 18.8 MB once downloads went into reused 64 KB slabs; 16.8 MB with the next song ready, from 24.3 MB | 2026-10-23 |
 | Playing, per 20 ms frame | about 2 small allocations, so pooling frames wouldn't help | 2026-10-23 |
 | A YouTube Music search | 0.68 s cold, 0.36–0.37 s warm, and at once from memory or narrowed from an earlier search | 2026-10-23 |
+| A YouTube Music search, again | 0.49–0.59 s warm, almost all of it YouTube's: its 12 KB answer, 191 KB unpacked, downloads in 5–10 ms and decodes in 2–3 ms | 2026-10-23 |
+| YouTube Music's search box | 0.12–0.14 s warm, but a few songs at most, and only words for "snooze s". Tried for suggestions and taken out: worse choices, and no faster in Discord | 2026-10-23 |
+| A song's lookup, then its first 64 KB | 0.19 s for the lookup, almost all YouTube's; 77 ms for the audio over a new connection | 2026-10-23 |
 | A SoundCloud link to its first frame | 0.94 s cold, 0.50 s warm, with lullaby reading the playlist itself; 1.14–1.34 s when ffmpeg read it | 2026-10-23 |
 | SoundCloud's key, found at startup | 0.71 s | 2026-10-23 |
 | A Spotify link to its first frame | about 1 s: its page, a YouTube Music search, then the song | 2026-10-23 |

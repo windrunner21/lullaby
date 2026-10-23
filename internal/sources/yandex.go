@@ -36,15 +36,24 @@ func (y *YandexMusic) Owns(link string) bool {
 	return strings.HasPrefix(h, "music.yandex.") && !strings.Contains(strings.TrimPrefix(h, "music.yandex."), ".")
 }
 
-// Track finds the song at a Yandex Music link, like /album/1/track/2 or
-// /track/2.
-func (y *YandexMusic) Track(ctx context.Context, link string) (Track, error) {
+// Key names a song by its ID, the same on every Yandex Music site and with
+// or without its album: music.yandex.ru/album/1/track/ID and
+// music.yandex.com/track/ID are one song.
+func (y *YandexMusic) Key(link string) (string, bool) {
 	u, err := url.Parse(strings.TrimSpace(link))
-	if err != nil {
-		return Track{}, err
+	if err != nil || !y.Owns(link) {
+		return "", false
 	}
+	if id, _ := yandexSong(u); id != "" {
+		return "yandex:" + id, true
+	}
+	return "", false
+}
+
+// yandexSong reads a song's ID from a link to it, alone or on its album.
+// list is set for an album or a playlist.
+func yandexSong(u *url.URL) (id string, list bool) {
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	var id string
 	switch {
 	case len(parts) == 4 && parts[0] == "album" && parts[2] == "track":
 		id = parts[3]
@@ -52,9 +61,26 @@ func (y *YandexMusic) Track(ctx context.Context, link string) (Track, error) {
 		id = parts[1]
 	case len(parts) == 2 && parts[0] == "album", len(parts) >= 2 && parts[0] == "playlists",
 		len(parts) == 4 && parts[0] == "users" && parts[2] == "playlists":
-		return Track{}, fmt.Errorf("yandex music %s: %w", link, songs.ErrPlaylist)
+		return "", true
 	}
 	if _, err := strconv.ParseUint(id, 10, 64); err != nil {
+		return "", false
+	}
+	return id, false
+}
+
+// Track finds the song at a Yandex Music link, like /album/1/track/2 or
+// /track/2.
+func (y *YandexMusic) Track(ctx context.Context, link string) (Track, error) {
+	u, err := url.Parse(strings.TrimSpace(link))
+	if err != nil {
+		return Track{}, err
+	}
+	id, list := yandexSong(u)
+	switch {
+	case list:
+		return Track{}, fmt.Errorf("yandex music %s: %w", link, songs.ErrPlaylist)
+	case id == "":
 		return Track{}, fmt.Errorf("yandex music %s: %w: not a song", link, songs.ErrUnplayable)
 	}
 

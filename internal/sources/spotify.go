@@ -47,6 +47,20 @@ func (s *Spotify) Owns(link string) bool {
 	return false
 }
 
+// Key names a song by its ID, from a link like
+// open.spotify.com/track/ID?si=CODE.
+func (s *Spotify) Key(link string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(link))
+	if h := host(link); err != nil || (h != "open.spotify.com" && h != "play.spotify.com") || strings.HasPrefix(u.Path, "/s/") {
+		return "", false
+	}
+	kind, id := spotifyPath(u.Path)
+	if kind != "track" || !spotifyID.MatchString(id) {
+		return "", false
+	}
+	return "spotify:" + id, true
+}
+
 // Track finds the song at a Spotify link.
 func (s *Spotify) Track(ctx context.Context, link string) (Track, error) {
 	u, err := url.Parse(strings.TrimSpace(link))

@@ -42,6 +42,37 @@ func (d *Deezer) Owns(link string) bool {
 	return false
 }
 
+// Key names a song by its ID, from a link like deezer.com/en/track/ID.
+func (d *Deezer) Key(link string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(link))
+	if err != nil || host(link) != "deezer.com" {
+		return "", false
+	}
+	if id, _ := deezerSong(u); id != "" {
+		return "deezer:" + id, true
+	}
+	return "", false
+}
+
+// deezerSong reads a song's ID from a deezer.com link, with or without its
+// language. list is set for an album or a playlist.
+func deezerSong(u *url.URL) (id string, list bool) {
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) > 0 && deezerLang.MatchString(parts[0]) {
+		parts = parts[1:]
+	}
+	switch {
+	case len(parts) == 2 && (parts[0] == "album" || parts[0] == "playlist"):
+		return "", true
+	case len(parts) != 2 || parts[0] != "track":
+		return "", false
+	}
+	if _, err := strconv.ParseUint(parts[1], 10, 64); err != nil {
+		return "", false
+	}
+	return parts[1], false
+}
+
 // Track finds the song at a Deezer link.
 func (d *Deezer) Track(ctx context.Context, link string) (Track, error) {
 	// A share link can lead to another before the song's own. Each is
@@ -60,21 +91,15 @@ func (d *Deezer) Track(ctx context.Context, link string) (Track, error) {
 	if err != nil {
 		return Track{}, fmt.Errorf("deezer: %w", err)
 	}
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) > 0 && deezerLang.MatchString(parts[0]) {
-		parts = parts[1:]
-	}
+	id, list := deezerSong(u)
 	switch {
-	case len(parts) == 2 && (parts[0] == "album" || parts[0] == "playlist"):
+	case list:
 		return Track{}, fmt.Errorf("deezer %s: %w", link, songs.ErrPlaylist)
-	case len(parts) != 2 || parts[0] != "track":
-		return Track{}, fmt.Errorf("deezer %s: %w: not a song", link, songs.ErrUnplayable)
-	}
-	if _, err := strconv.ParseUint(parts[1], 10, 64); err != nil {
+	case id == "":
 		return Track{}, fmt.Errorf("deezer %s: %w: not a song", link, songs.ErrUnplayable)
 	}
 
-	body, status, err := getPage(ctx, d.http, d.api+"/track/"+parts[1])
+	body, status, err := getPage(ctx, d.http, d.api+"/track/"+id)
 	if err != nil {
 		return Track{}, fmt.Errorf("deezer: %w", err)
 	}
@@ -118,7 +143,7 @@ func (d *Deezer) Track(ctx context.Context, link string) (Track, error) {
 		t.Artists = []string{track.Artist.Name}
 	}
 	if t.Link == "" {
-		t.Link = "https://www.deezer.com/track/" + parts[1]
+		t.Link = "https://www.deezer.com/track/" + id
 	}
 	return t, nil
 }

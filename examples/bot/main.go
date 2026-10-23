@@ -166,7 +166,7 @@ func (b *musicBot) suggest(e *handler.AutocompleteEvent) error {
 	ctx, cancel := context.WithTimeout(e.Ctx, 2500*time.Millisecond)
 	defer cancel()
 	choices := []discord.AutocompleteChoice{}
-	for _, s := range b.music.Suggest(ctx, e.Data.String("song")) {
+	for _, s := range b.music.SuggestFor(ctx, lullaby.SuggestRequest{GuildID: guildID, UserID: e.User().ID, Query: e.Data.String("song")}) {
 		name := s.Title
 		if s.Artist != "" {
 			name += " · " + s.Artist

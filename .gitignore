@@ -1,5 +1,6 @@
 # Build and test output
 /bin/
+/build/
 *.test
 *.out
 go.work

@@ -59,13 +59,14 @@ func Example() {
 // Autocomplete suggests songs while someone types, and gets ready for the one
 // they'll pick: it joins their voice channel, warms up YouTube and starts an
 // ffmpeg, so the song starts as soon as they press Enter.
-func ExampleEngine_Suggest() {
+func ExampleEngine_SuggestFor() {
 	var music *lullaby.Engine
 	autocomplete := func(e *handler.AutocompleteEvent, voiceChannelID snowflake.ID) error {
 		music.JoinEarly(*e.GuildID(), voiceChannelID)
 		music.GetReady()
 		choices := []discord.AutocompleteChoice{}
-		for _, s := range music.Suggest(e.Ctx, e.Data.String("song")) {
+		typing := lullaby.SuggestRequest{GuildID: *e.GuildID(), UserID: e.User().ID, Query: e.Data.String("song")}
+		for _, s := range music.SuggestFor(e.Ctx, typing) {
 			// The value is the song's link, which Play plays at once, with
 			// YouTube Music's title and artist.
 			choices = append(choices, discord.AutocompleteChoiceString{Name: s.Title + " · " + s.Artist, Value: s.Link})
