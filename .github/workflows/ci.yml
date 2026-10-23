@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The oldest Go lullaby supports, which dave-go needs, and the newest.
+        go: ["1.26", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      # The stream tests run ffmpeg itself; the rest stand in for it.
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: gofmt
+        run: test -z "$(gofmt -s -l .)" || { gofmt -s -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race -timeout 120s ./...

@@ -1,0 +1,20 @@
+# Build and test output
+/bin/
+*.test
+*.out
+go.work
+go.work.sum
+
+# A spare YouTube account's cookies, which are like a password
+*cookies*.txt
+
+# Personal Claude Code notes and settings
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
