@@ -90,6 +90,8 @@ Measure on real hardware, not a laptop: [BENCHMARKS.md](BENCHMARKS.md) has the m
 
 ## Sending a change
 
+Fork the repository, make the change on a branch, and open a pull request against `main`. CI runs `make check`'s steps on Go 1.26 and the newest Go, and both have to pass before it can be merged; from a fork, CI starts once a maintainer has let it run. Found a security problem? Report it privately, from the repository's Security tab, rather than in an issue.
+
 - `make check` passes.
 - Say what you tried in Discord: timing and voice only show up live.
 - Keep each change to one thing, and match the code around it.
