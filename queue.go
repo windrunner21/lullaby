@@ -20,6 +20,9 @@ import (
 // playing already: at the front with next. It returns the song's place in the
 // queue, or 0 when it plays now. It waits until ctx is done at most.
 func (e *Engine) start(ctx context.Context, guildID, channelID snowflake.ID, query string, t *Track, next bool) (int, error) {
+	if t.autoplay {
+		return e.startPick(ctx, guildID, query, t, next)
+	}
 	if p := e.playingIn(guildID); p != nil {
 		song, err := e.findFor(ctx, query)
 		if err != nil {
@@ -32,6 +35,80 @@ func (e *Engine) start(ctx context.Context, guildID, channelID snowflake.ID, que
 		// The music ran out while the song was being found, so it plays now.
 	}
 	return e.playNow(ctx, guildID, channelID, query, t, next)
+}
+
+// startPick is start for a song the app chose by itself: it plays in the
+// player already in voice in the server, at once if nothing plays there and
+// nothing waits, or in its queue. It never joins voice, so a song picked as
+// the music stopped can't bring the bot back, and fails with ErrStopped when
+// there's no player in voice. Once ctx is done it doesn't start or go in
+// line either, so the app can call a pick off while it's being found.
+func (e *Engine) startPick(ctx context.Context, guildID snowflake.ID, query string, t *Track, next bool) (int, error) {
+	e.mu.Lock()
+	p, ok := e.players[guildID]
+	inVoice := ok && p.conn != nil
+	e.mu.Unlock()
+	if !inVoice {
+		return 0, ErrStopped
+	}
+	song, err := e.findFor(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	t.song = song
+
+	// Behind songs waiting, it gets ready when its turn comes near, as
+	// any song does.
+	e.mu.Lock()
+	if behind := len(p.queue) > 0; behind || ctx.Err() != nil || e.players[guildID] != p {
+		place, err := e.pickLocked(ctx, guildID, p, t, next)
+		e.mu.Unlock()
+		if place > 0 {
+			go e.prepare(guildID)
+		}
+		return place, err
+	}
+	e.mu.Unlock()
+
+	// Nothing waits, so it's next or plays now: its stream starts at once.
+	life := e.life()
+	stream, err := e.ffmpegFor(life)
+	if err != nil {
+		return 0, err
+	}
+	if stream, err = e.feedFor(ctx, life, stream, song); err != nil {
+		return 0, err
+	}
+	t.stream, t.cover = stream, e.coverAhead(song)
+	e.mu.Lock()
+	place, err := e.pickLocked(ctx, guildID, p, t, next)
+	e.mu.Unlock()
+	switch {
+	case err != nil:
+		stream.Close()
+	case place > 0:
+		go e.prepare(guildID)
+	}
+	return place, err
+}
+
+// pickLocked plays t, a pick, in want now if nothing plays and nothing waits
+// and it has a stream, or puts it in the queue, behind the songs waiting. It
+// fails with ErrStopped if want isn't the server's player in voice anymore,
+// and with ctx's error once ctx is done, checked here so that calling a pick
+// off can't race with it starting. e.mu must be held.
+func (e *Engine) pickLocked(ctx context.Context, guildID snowflake.ID, want *player, t *Track, next bool) (int, error) {
+	if p, ok := e.players[guildID]; !ok || p != want || p.conn == nil {
+		return 0, ErrStopped
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if want.playing == nil && len(want.queue) == 0 && t.stream != nil {
+		want.playLocked(t, nil)
+		return 0, nil
+	}
+	return e.insert(want, t, next)
 }
 
 // findFor finds a song for someone who waits until ctx is done at most. The

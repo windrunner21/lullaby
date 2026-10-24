@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -82,6 +83,117 @@ func TestAutoplayWaitsBehind(t *testing.T) {
 	}
 	if next, more, ok := e.UpNextTrack(1); !ok || next != p.queue[0] || more != 5 || next.Autoplay() {
 		t.Errorf("UpNextTrack = %v (+%d), %v; want Good Days's Track and 5 more", next, more, ok)
+	}
+}
+
+func TestPicksDontJoinVoice(t *testing.T) {
+	// A song the app chose by itself plays in the player in voice, at once
+	// if nothing plays there, and never makes the bot join.
+	client := &http.Client{Transport: fakeTransport(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/player") {
+			return answer200(`{"playabilityStatus":{"status":"OK"},"videoDetails":{"title":"Me & U","lengthSeconds":"193"},` +
+				`"streamingData":{"expiresInSeconds":"21600","adaptiveFormats":[{"mimeType":"audio/mp4","bitrate":128000,"url":"https://audio.invalid/a"}]}}`), nil
+		}
+		return answer200("audio"), nil
+	})}
+	e := offlineEngine(t, client, silentEncoder(t), "")
+	pick := Request{GuildID: 1, ChannelID: 100, Query: songs.WatchLink("UPeS_V1pVZk"), Autoplay: true}
+
+	if _, _, err := e.Play(context.Background(), pick); !errors.Is(err, ErrStopped) {
+		t.Errorf("a pick with nobody in voice: %v, want ErrStopped", err)
+	}
+	if _, ok := e.Channel(1); ok {
+		t.Fatal("a pick made the bot join voice")
+	}
+
+	if _, err := e.join(context.Background(), 1, 100, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	tr, place, err := e.Play(context.Background(), pick)
+	if err != nil || place != 0 {
+		t.Fatalf("a pick in a quiet player went in at %d, %v; want it playing", place, err)
+	}
+	if now, _ := e.Playing(1); now != tr || !tr.Autoplay() {
+		t.Error("the pick isn't playing, or doesn't say it's a pick")
+	}
+}
+
+func TestPickWaitsBehindALateHandover(t *testing.T) {
+	// Nothing plays, since the next song wasn't ready in time, and a pick
+	// comes: it waits behind that song rather than starting ahead of it.
+	e := &Engine{ctx: context.Background(), players: map[snowflake.ID]*player{}, events: app{}}
+	encoder := silentEncoder(t)
+	waiting := &Track{song: songs.Song{Title: "asked for"}, stream: bufferedStream(t, encoder)} // ready, so nothing is looked up
+	p := &player{conn: &quietConn{}, frames: &frames{}, queue: []*Track{waiting}, idle: time.NewTimer(time.Hour)}
+	defer p.idle.Stop()
+	e.players[1] = p
+	pick := &Track{song: songs.Song{Title: "picked"}, autoplay: true, stream: bufferedStream(t, encoder)}
+	e.mu.Lock()
+	place, err := e.pickLocked(context.Background(), 1, p, pick, false)
+	e.mu.Unlock()
+	if err != nil || place != 2 {
+		t.Errorf("the pick went in at %d, %v; want it behind the song waiting", place, err)
+	}
+	if queue := e.Queue(1); len(queue) != 2 || queue[0] != waiting || queue[1] != pick {
+		t.Errorf("Queue = %v, want the song asked for, then the pick", queue)
+	}
+	if e.Queue(2) != nil {
+		t.Error("a server with no player has a queue")
+	}
+}
+
+func TestPickCalledOff(t *testing.T) {
+	// A pick's context is done by the time it would start: it doesn't
+	// start, nor go in line.
+	e := &Engine{ctx: context.Background(), players: map[snowflake.ID]*player{}, events: app{}}
+	p := &player{conn: &quietConn{}, frames: &frames{}, idle: time.NewTimer(time.Hour)}
+	defer p.idle.Stop()
+	e.players[1] = p
+	off, cancel := context.WithCancel(context.Background())
+	cancel()
+	pick := &Track{song: songs.Song{Title: "picked"}, autoplay: true, stream: bufferedStream(t, silentEncoder(t))}
+	e.mu.Lock()
+	_, err := e.pickLocked(off, 1, p, pick, false)
+	playing, waiting := p.playing, len(p.queue)
+	e.mu.Unlock()
+	if !errors.Is(err, context.Canceled) || playing != nil || waiting != 0 {
+		t.Errorf("a pick called off: %v, playing %v, %d waiting; want it nowhere", err, playing, waiting)
+	}
+}
+
+func TestPickBehindWaitsWithoutAStream(t *testing.T) {
+	// A pick that goes in behind a song waiting doesn't start its ffmpeg
+	// and download yet, only to have them closed: it gets ready later. So
+	// it goes in even with its ffmpeg gone.
+	client := &http.Client{Transport: fakeTransport(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/player") {
+			return answer200(`{"playabilityStatus":{"status":"OK"},"videoDetails":{"title":"Me & U","lengthSeconds":"193"},` +
+				`"streamingData":{"expiresInSeconds":"21600","adaptiveFormats":[{"mimeType":"audio/mp4","bitrate":128000,"url":"https://audio.invalid/pick"}]}}`), nil
+		}
+		return answer200("audio"), nil
+	})}
+	ffmpeg := silentEncoder(t)
+	e := offlineEngine(t, client, ffmpeg, "")
+	p, err := e.join(context.Background(), 1, 100, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoder := silentEncoder(t)
+	e.mu.Lock()
+	p.playing = &Track{stream: bufferedStream(t, encoder)}
+	p.queue = []*Track{{song: songs.Song{Title: "asked for"}, stream: bufferedStream(t, encoder)}}
+	e.mu.Unlock()
+	if err := os.Remove(ffmpeg); err != nil {
+		t.Fatal(err)
+	}
+	pick, place, err := e.Play(context.Background(), Request{GuildID: 1, ChannelID: 100, Query: songs.WatchLink("UPeS_V1pVZk"), Autoplay: true})
+	if err != nil || place != 2 {
+		t.Fatalf("the pick went in at %d, %v; want it behind the song waiting, without its ffmpeg", place, err)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if pick.stream != nil {
+		t.Error("a pick behind a song waiting started its stream")
 	}
 }
 

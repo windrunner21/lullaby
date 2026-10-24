@@ -234,6 +234,11 @@ type Request struct {
 	Asked time.Time
 	// Autoplay marks a song the app chose by itself, like one from Radio
 	// when the queue ran out: songs asked for without Next go ahead of it.
+	// It plays only in the player already in voice, at once if nothing
+	// plays and nothing waits there, and Play never joins voice for it, so
+	// a pick found as the music stopped can't bring the bot back: it fails
+	// with ErrStopped. Once Play's ctx is done, it neither starts nor goes
+	// in line, so the app can call a pick off while it's being found.
 	Autoplay bool
 }
 
@@ -597,6 +602,18 @@ func (e *Engine) UpNext(guildID snowflake.ID) (songs.Song, int, bool) {
 		return songs.Song{}, 0, false
 	}
 	return owned(p.queue[0].song), len(p.queue) - 1, true
+}
+
+// Queue returns the songs waiting in a server's queue, the next first. It's
+// a copy, and the queue can change as soon as it's returned.
+func (e *Engine) Queue(guildID snowflake.ID) []*Track {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	p, ok := e.players[guildID]
+	if !ok {
+		return nil
+	}
+	return slices.Clone(p.queue)
 }
 
 // UpNextTrack is UpNext with the song's Track, for its Meta.
