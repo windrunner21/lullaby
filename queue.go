@@ -138,10 +138,7 @@ func (e *Engine) begin(guildID snowflake.ID, want *player, t *Track, next bool, 
 		return 0, ErrStopped
 	}
 	if p.playing == nil {
-		p.playing, p.paused = t, false
-		p.frames.pause(false)
-		p.frames.play(t.stream, started)
-		p.idle.Stop()
+		p.playLocked(t, started)
 		e.mu.Unlock()
 		return 0, nil
 	}
@@ -179,27 +176,35 @@ func (e *Engine) enqueue(guildID snowflake.ID, want *player, t *Track, next bool
 }
 
 // insert puts t in p's queue, at the front with next, and returns its place.
-// Only the song next in line keeps its stream started. e.mu must be held.
+// A song asked for goes ahead of the ones the app chose by itself. Only the
+// song next in line keeps its stream started. e.mu must be held.
 func (e *Engine) insert(p *player, t *Track, next bool) (int, error) {
 	if len(p.queue) >= MaxQueue {
 		return 0, ErrFull
 	}
-	place := len(p.queue) + 1
-	if next {
-		p.queue, place = append([]*Track{t}, p.queue...), 1
-	} else {
-		p.queue = append(p.queue, t)
+	i := len(p.queue)
+	switch {
+	case next:
+		i = 0
+	case !t.autoplay:
+		if first := slices.IndexFunc(p.queue, (*Track).Autoplay); first >= 0 {
+			i = first
+		}
 	}
+	p.queue = slices.Insert(p.queue, i, t)
+	place := i + 1
 	// frames may have taken over with a song a moment before moved takes it
-	// out of the queue: that one plays on.
-	playing := p.frames.current()
+	// out of the queue: that one plays on. Told apart in the same step that
+	// gives frames the new song next in line, so the one before can't take
+	// over while its stream is being closed.
+	playing := p.frames.requeue(ready(p.queue))
 	for _, q := range p.queue[1:] {
 		if q.stream != nil && opus(q.stream) != playing {
 			q.stream.Close()
 			q.stream = nil
 		}
 	}
-	p.frames.queue(ready(p.queue))
+	p.queueChangedLocked()
 	return place, nil
 }
 
@@ -225,7 +230,13 @@ func (e *Engine) prepare(guildID snowflake.ID) {
 	t.preparing = make(chan struct{})
 	song := t.song
 	e.mu.Unlock()
+	e.getReady(guildID, p, t, song)
+}
 
+// getReady starts the stream of t, the song next in line in p, which its
+// caller has marked as preparing, and has it take over once the song playing
+// runs out, if it's still next in line by then.
+func (e *Engine) getReady(guildID snowflake.ID, p *player, t *Track, song songs.Song) {
 	ctx := e.life()
 	song = e.fresh(ctx, song)
 	stream, err := e.openSong(ctx, song)
@@ -402,46 +413,81 @@ func (e *Engine) afterMove(guildID snowflake.ID, old, now *Track, from opus, lat
 }
 
 // advance plays the next song in line when it wasn't ready in time, and
-// passes over songs that won't start.
+// passes over songs that won't start. One advance works for a player at a
+// time, so two can't start songs out of order: another one asked for
+// meanwhile leaves a note for the one at work, which goes round again before
+// it's done. The app is told about the songs it started once it's done, so
+// a slow app doesn't hold up the next song.
 func (e *Engine) advance(guildID snowflake.ID) {
+	e.mu.Lock()
+	p, ok := e.players[guildID]
+	if !ok {
+		e.mu.Unlock()
+		return
+	}
+	if p.advancing {
+		p.again = true
+		e.mu.Unlock()
+		return
+	}
+	p.advancing = true
+	var started []*Track
 	for {
-		e.mu.Lock()
-		p, ok := e.players[guildID]
-		if !ok || p.playing != nil || e.lifeLocked().Err() != nil {
-			e.mu.Unlock()
-			return
+		if t := e.advanceLocked(guildID, p); t != nil {
+			started = append(started, t)
+		}
+		if !p.again || e.players[guildID] != p {
+			break
+		}
+		p.again = false
+	}
+	p.advancing = false
+	e.mu.Unlock()
+	for _, t := range started {
+		e.events.Started(guildID, t)
+	}
+}
+
+// advanceLocked is the advance at work's: it plays the next song in line,
+// once it's ready, and returns it; or nil when another song plays or none is
+// left. A song not ready yet gets ready while it stays first in line, so no
+// song behind it can get ready and take over first, and one that won't
+// start is passed over by getReady. e.mu is held throughout, but for the
+// waits, and a ready song is taken from the queue and started in one go, so
+// no other song can start in between.
+func (e *Engine) advanceLocked(guildID snowflake.ID, p *player) *Track {
+	for {
+		if e.players[guildID] != p || p.playing != nil || p.conn == nil || e.lifeLocked().Err() != nil {
+			return nil
 		}
 		if len(p.queue) == 0 {
 			p.idle.Reset(idleFor)
-			e.mu.Unlock()
-			return
+			return nil
 		}
 		t := p.queue[0]
-		if wait := t.preparing; wait != nil && t.stream == nil {
-			// It's on its way already.
+		if t.stream == nil {
+			if t.preparing == nil {
+				t.preparing = make(chan struct{})
+				go e.getReady(guildID, p, t, t.song)
+			}
+			// Waited for, unless the queue changes meanwhile and another song
+			// is next.
+			if p.changed == nil {
+				p.changed = make(chan struct{})
+			}
+			wait, changed := t.preparing, p.changed
 			e.mu.Unlock()
-			<-wait
+			select {
+			case <-wait:
+			case <-changed:
+			}
+			e.mu.Lock()
 			continue
 		}
 		p.queue = p.queue[1:]
-		stream, song := t.stream, t.song
-		e.mu.Unlock()
-
-		if stream == nil {
-			ctx := e.life()
-			stream, err := e.openSong(ctx, e.fresh(ctx, song))
-			if err != nil {
-				e.logger().Warn("song won't start", slog.String("song", song.Title), redact.Attr(err))
-				continue
-			}
-			e.mu.Lock()
-			t.stream = stream
-			e.mu.Unlock()
-		}
-		if place, err := e.begin(guildID, p, t, true, nil); place == 0 && err == nil {
-			go e.prepare(guildID) // before the app shows it, which can take seconds
-			e.events.Started(guildID, t)
-		}
-		return
+		p.frames.queue(ready(p.queue)) // it plays now, rather than next
+		p.playLocked(t, nil)
+		go e.prepare(guildID) // the one after it, before the app is told, which can take seconds
+		return t
 	}
 }

@@ -188,9 +188,37 @@ LULLABY_COMPARE_FFMPEG=/usr/bin/ffmpeg,./ffmpeg-linux-arm64 LULLABY_COMPARE_SONG
 
 It takes about a minute per build and asks no site for anything.
 
+## Decoding YouTube's answers
+
+Every answer from YouTube's API is read whole into a buffer kept between requests, then decoded (`decode` in `internal/sources/youtube.go`). Until v0.3.0, a `json.Decoder` read it, growing a buffer of its own for every answer. On the Pi on 2026-10-24, with YouTube Music's whole 566 KB answer for a song's radio, read 32 KB at a time as it comes, to its 50 songs:
+
+| | `json.Decoder`, before | A kept buffer, now |
+|---|---|---|
+| Time | 5.9–7.2 ms | **3.8 ms** |
+| Garbage | 2.2 MB | **0.15–0.16 MB** |
+| Allocations | about 1,500 | 1,386 |
+
+Searches and lookups are read the same way. A buffer is kept only while it's used again: Go's garbage collector lets idle ones go after two collections, and one grown past 2 MB isn't kept at all.
+
+### Running it again
+
+`go test -run '^$' -bench Decode -benchmem ./internal/sources` runs it on any machine. For the Pi:
+
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go test -c -o bin/sources-linux-arm64.test ./internal/sources
+```
+
+Copy it to the Pi, with `internal/sources/testdata/` as `testdata/` next to it, then:
+
+```sh
+./sources-linux-arm64.test -test.run '^$' -test.bench Decode -test.benchmem
+```
+
+The answer, `testdata/radio-snooze.json.gz`, was saved from YouTube Music, with the asker's visitor ID taken out and its tracking tokens blanked at the same length. It asks no site for anything.
+
 ## Other measurements
 
-Also on the Pi, while the engine was being built inside Rem's Little Helper:
+Also on the Pi, while the engine was being built, first inside Rem's Little Helper:
 
 | What | Measured | When |
 |---|---|---|
@@ -209,3 +237,5 @@ Also on the Pi, while the engine was being built inside Rem's Little Helper:
 | Spotify, Apple Music, Deezer and Yandex Music | 0.24–0.48 s to read a song; six of six test songs matched on YouTube Music, one in Cyrillic | 2026-10-23 |
 | yt-dlp, the backup | 5–6 s per lookup: 0.9 s to start, about 1.4 s for YouTube's JavaScript with Bun | 2026-10-22 |
 | Go's 20 ms timer | within 1.1 ms, even with 13,651 garbage collections in 30 s | 2026-10-22 |
+| YouTube Music's radio for a song | 49 songs in 1.0 s cold, 0.81 s warm, almost all YouTube's; at once from memory | 2026-10-24 |
+| A radio kept in memory | under 24 KB, so 200, the most kept, under 5 MB | 2026-10-24 |

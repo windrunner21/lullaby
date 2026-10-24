@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os/exec"
+	"slices"
 	"sync"
 	"time"
 
@@ -63,6 +64,9 @@ const (
 	// searchTimeout is the longest a search may take, even with nobody
 	// waiting for it anymore.
 	searchTimeout = 10 * time.Second
+	// maxRadios is how many songs' radios are remembered at most. One is
+	// about 50 songs, about 24 KB on the Pi, so a full memory is about 5 MB.
+	maxRadios = 200
 	// settleAfter is how long someone has stopped typing before the first
 	// song suggested to them is looked up: long enough that a fast typist's
 	// keystrokes don't each cost a lookup, short enough that it's ready
@@ -104,6 +108,9 @@ var (
 	// ErrStopped is returned by Play when the music was stopped before the
 	// song could start.
 	ErrStopped = errors.New("the music stopped")
+	// ErrNoRadio is returned by Radio for a song without a YouTube video,
+	// like SoundCloud's, which YouTube Music has no radio for.
+	ErrNoRadio = errors.New("no radio for this song")
 )
 
 // Config is what an Engine works with. Voice and DAVE are needed; the rest
@@ -179,7 +186,9 @@ func (noEvents) QueueChanged(snowflake.ID)       {}
 // never calls them while it holds its own lock, so they may call the engine,
 // and the app may call the engine while holding a lock its events take. They
 // can be called at the same time from different goroutines, for different
-// servers or for one, so they must be safe for that.
+// servers or for one, so they must be safe for that, and in no set order: a
+// song that breaks off as soon as it starts can be told about as Ended
+// before Started. Playing says what plays now.
 type Events interface {
 	// Started is called when a song from the queue starts playing by itself,
 	// after the one before it. A song Play starts at once isn't told about.
@@ -223,6 +232,9 @@ type Request struct {
 	// Asked is when it was asked for, which the log counts from. It may be
 	// zero.
 	Asked time.Time
+	// Autoplay marks a song the app chose by itself, like one from Radio
+	// when the queue ran out: songs asked for without Next go ahead of it.
+	Autoplay bool
 }
 
 // Track is a song in a server, playing or waiting its turn.
@@ -232,7 +244,8 @@ type Track struct {
 	// while others read it keeps it safe itself.
 	Meta any
 
-	e *Engine
+	e        *Engine
+	autoplay bool // Request.Autoplay's, which never changes
 	// The rest is guarded by e.mu.
 	song    songs.Song
 	stream  *audio.Stream // started once it plays, or is next in line
@@ -253,6 +266,10 @@ func (t *Track) Song() songs.Song {
 	defer t.e.mu.Unlock()
 	return owned(t.song)
 }
+
+// Autoplay reports whether the app chose the song by itself, with
+// Request.Autoplay.
+func (t *Track) Autoplay() bool { return t.autoplay }
 
 // owned is a copy of song that doesn't share its header map, for callers
 // that may change what they're given.
@@ -299,6 +316,31 @@ type player struct {
 	queue     []*Track      // queue[0] plays next; its stream starts early, so it plays without a gap
 	paused    bool
 	idle      *time.Timer // leaves once nothing has played for a while
+	// advancing is true while an advance is at work, and again when another
+	// was asked for meanwhile.
+	advancing, again bool
+	// changed is closed when the queue changes, for an advance waiting for
+	// the song next in line, which may not be next anymore; nil while none
+	// waits.
+	changed chan struct{}
+}
+
+// playLocked plays t now, in a player with nothing playing. e.mu must be
+// held.
+func (p *player) playLocked(t *Track, started func()) {
+	p.playing, p.paused = t, false
+	p.frames.pause(false)
+	p.frames.play(t.stream, started)
+	p.idle.Stop()
+}
+
+// queueChangedLocked wakes an advance waiting for the song next in line.
+// e.mu must be held.
+func (p *player) queueChangedLocked() {
+	if p.changed != nil {
+		close(p.changed)
+		p.changed = nil
+	}
 }
 
 // Engine plays music in any number of servers.
@@ -325,6 +367,8 @@ type Engine struct {
 	suggested map[string]suggestion        // by link
 	searched  map[string]search            // by searchKey
 	searching map[string]*searching        // searches on their way, by searchKey
+	radios    map[string]search            // by video ID
+	radioing  map[string]*searching        // radios on their way, by video ID
 	typing    map[typist]*typing           // each typist's last keystroke
 	// lookedAhead is when the early lookups in the last day asked YouTube,
 	// and lookingAhead how many are asking now.
@@ -524,7 +568,7 @@ func (e *Engine) Play(ctx context.Context, r Request) (*Track, int, error) {
 	if e.life().Err() != nil {
 		return nil, 0, fmt.Errorf("%w: the engine's lifetime is over", ErrStopped)
 	}
-	t := &Track{Meta: r.Meta, e: e, asked: r.Asked}
+	t := &Track{Meta: r.Meta, e: e, asked: r.Asked, autoplay: r.Autoplay}
 	place, err := e.start(ctx, r.GuildID, r.ChannelID, r.Query, t, r.Next)
 	if err != nil {
 		return nil, 0, public(err)
@@ -553,6 +597,49 @@ func (e *Engine) UpNext(guildID snowflake.ID) (songs.Song, int, bool) {
 		return songs.Song{}, 0, false
 	}
 	return owned(p.queue[0].song), len(p.queue) - 1, true
+}
+
+// UpNextTrack is UpNext with the song's Track, for its Meta.
+func (e *Engine) UpNextTrack(guildID snowflake.ID) (*Track, int, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	p, ok := e.players[guildID]
+	if !ok || len(p.queue) == 0 {
+		return nil, 0, false
+	}
+	return p.queue[0], len(p.queue) - 1, true
+}
+
+// Remove takes t out of a server's queue before its turn, like a song the
+// app chose by itself that's no longer wanted, and reports whether it was
+// waiting there. The song after it gets ready in its place. A song that has
+// started isn't removed: Skip it or StopSong it instead.
+func (e *Engine) Remove(guildID snowflake.ID, t *Track) bool {
+	e.mu.Lock()
+	p, ok := e.players[guildID]
+	if !ok {
+		e.mu.Unlock()
+		return false
+	}
+	i := slices.Index(p.queue, t)
+	// frames may have taken over with it a moment before moved takes it out
+	// of the queue: then it's playing.
+	if i < 0 || t.stream != nil && !p.frames.unqueue(t.stream) {
+		e.mu.Unlock()
+		return false
+	}
+	p.queue = slices.Delete(p.queue, i, i+1)
+	stream := t.stream
+	t.stream = nil
+	p.queueChangedLocked()
+	e.mu.Unlock()
+	if stream != nil {
+		stream.Close()
+	}
+	if i == 0 {
+		go e.prepare(guildID) // the song next in line now, unless it's ready or on its way
+	}
+	return true
 }
 
 // Channel returns the voice channel the player is in, or on its way to, in

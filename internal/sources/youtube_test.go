@@ -1,12 +1,14 @@
 package sources
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -76,6 +78,24 @@ const (
 		"playlistItemData": {"videoId": "MtUefXEQRAY"}
 	}}
 ]}}]}}}}]}}}`
+
+	// musicRadioSnooze is YouTube Music's radio for Snooze, cut down to its
+	// first four songs, then one wrapped the way ytmusicapi reads a song that
+	// has a music video too, one with no video ID, and one YouTube won't play
+	// here.
+	musicRadioSnooze = `{"contents": {"singleColumnMusicWatchNextResultsRenderer": {"tabbedRenderer": {"watchNextTabbedResultsRenderer": {"tabs": [
+	{"tabRenderer": {"title": "Up next", "content": {"musicQueueRenderer": {"content": {"playlistPanelRenderer": {"playlistId": "RDAMVMZqSlV5LmrTg", "isInfinite": true, "contents": [
+	{"playlistPanelVideoRenderer": {"title": {"runs": [{"text": "Snooze"}]}, "longBylineText": {"runs": [{"text": "SZA"}, {"text": " • "}, {"text": "SOS"}, {"text": " • "}, {"text": "2022"}]}, "thumbnail": {"thumbnails": [{"url": "https://yt3.googleusercontent.com/o3i9-dA34xDjbw1hz4nhJO6LA6V4-ZYjs_kh7aUA0sq1pieJejt_Hnor-Rxl77GA1ugAFqxcmEUwy3c=w60-h60-l90-rj", "width": 60, "height": 60}, {"url": "https://yt3.googleusercontent.com/o3i9-dA34xDjbw1hz4nhJO6LA6V4-ZYjs_kh7aUA0sq1pieJejt_Hnor-Rxl77GA1ugAFqxcmEUwy3c=w544-h544-l90-rj", "width": 544, "height": 544}]}, "lengthText": {"runs": [{"text": "3:22"}]}, "shortBylineText": {"runs": [{"text": "SZA"}]}, "videoId": "ZqSlV5LmrTg", "navigationEndpoint": {"watchEndpoint": {"videoId": "ZqSlV5LmrTg", "playlistId": "RDAMVMZqSlV5LmrTg"}}}},
+	{"playlistPanelVideoRenderer": {"title": {"runs": [{"text": "Kill Bill"}]}, "longBylineText": {"runs": [{"text": "SZA"}, {"text": " • "}, {"text": "SOS"}, {"text": " • "}, {"text": "2022"}]}, "thumbnail": {"thumbnails": [{"url": "https://yt3.googleusercontent.com/tw5VGXEsehs9OpwnpbubqGp_3Pq9so7QShdyJSlCpXeI2mLRvqRqLNbA7EC4zcNWrFE0_lj9HxpZ23v6=w60-h60-l90-rj", "width": 60, "height": 60}, {"url": "https://yt3.googleusercontent.com/tw5VGXEsehs9OpwnpbubqGp_3Pq9so7QShdyJSlCpXeI2mLRvqRqLNbA7EC4zcNWrFE0_lj9HxpZ23v6=w544-h544-l90-rj", "width": 544, "height": 544}]}, "lengthText": {"runs": [{"text": "2:34"}]}, "shortBylineText": {"runs": [{"text": "SZA"}]}, "videoId": "AdEKgwUqPKI", "navigationEndpoint": {"watchEndpoint": {"videoId": "AdEKgwUqPKI", "playlistId": "RDAMVMZqSlV5LmrTg"}}}},
+	{"playlistPanelVideoRenderer": {"title": {"runs": [{"text": "Stuck with U"}]}, "longBylineText": {"runs": [{"text": "Justin Bieber"}, {"text": " & "}, {"text": "Ariana Grande"}, {"text": " • "}, {"text": "Stuck with U"}, {"text": " • "}, {"text": "2020"}]}, "thumbnail": {"thumbnails": [{"url": "https://yt3.googleusercontent.com/01h_mqhBieUtbt2J_3ypc-0uIwP8CFScDXbjJauYwbJeLJWwHGf7l1Wc_jPtUb97uYXaCVFnuXJtfS1p=w60-h60-l90-rj", "width": 60, "height": 60}, {"url": "https://yt3.googleusercontent.com/01h_mqhBieUtbt2J_3ypc-0uIwP8CFScDXbjJauYwbJeLJWwHGf7l1Wc_jPtUb97uYXaCVFnuXJtfS1p=w544-h544-l90-rj", "width": 544, "height": 544}]}, "lengthText": {"runs": [{"text": "3:49"}]}, "shortBylineText": {"runs": [{"text": "Justin Bieber"}, {"text": " & "}, {"text": "Ariana Grande"}]}, "videoId": "yEA3qaB0dH8", "navigationEndpoint": {"watchEndpoint": {"videoId": "yEA3qaB0dH8", "playlistId": "RDAMVMZqSlV5LmrTg"}}}},
+	{"playlistPanelVideoRenderer": {"title": {"runs": [{"text": "Me & U"}]}, "longBylineText": {"runs": [{"text": "Tems"}, {"text": " • "}, {"text": "Born in the Wild"}, {"text": " • "}, {"text": "2024"}]}, "thumbnail": {"thumbnails": [{"url": "https://yt3.googleusercontent.com/tlyJWhyQD82vitariliG7hxAr5ODJvQDYfFYB9Wg-pmBUYlutoqmhJ2TgJEWLevCWKyAV1hitcJbnP4=w60-h60-l90-rj", "width": 60, "height": 60}, {"url": "https://yt3.googleusercontent.com/tlyJWhyQD82vitariliG7hxAr5ODJvQDYfFYB9Wg-pmBUYlutoqmhJ2TgJEWLevCWKyAV1hitcJbnP4=w544-h544-l90-rj", "width": 544, "height": 544}]}, "lengthText": {"runs": [{"text": "3:13"}]}, "shortBylineText": {"runs": [{"text": "Tems"}]}, "videoId": "UPeS_V1pVZk", "navigationEndpoint": {"watchEndpoint": {"videoId": "UPeS_V1pVZk", "playlistId": "RDAMVMZqSlV5LmrTg"}}}},
+	{"playlistPanelVideoWrapperRenderer": {"primaryRenderer": {"playlistPanelVideoRenderer": {"title": {"runs": [{"text": "Saturn"}]}, "shortBylineText": {"runs": [{"text": "SZA"}]}, "lengthText": {"runs": [{"text": "3:07"}]}, "videoId": "i4YmKvw6mCY"}}, "counterpart": [{"counterpartRenderer": {"playlistPanelVideoRenderer": {"title": {"runs": [{"text": "Saturn (Official Video)"}]}, "videoId": "aaaaaaaaaaa"}}}]}},
+	{"playlistPanelVideoRenderer": {"title": {"runs": [{"text": "Video unavailable"}]}}},
+	{"playlistPanelVideoRenderer": {"title": {"runs": [{"text": "Blocked here"}]}, "videoId": "bbbbbbbbbbb", "unplayableText": {"runs": [{"text": "Video unavailable"}]}}}
+	]}}}}}},
+	{"tabRenderer": {"title": "Lyrics"}},
+	{"tabRenderer": {"title": "Related"}}
+]}}}}}`
 )
 
 // fakeAPI answers like YouTube's API and video servers.
@@ -125,6 +145,8 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, strings.ReplaceAll(f.player, "AUDIO_URL", f.url))
 	case "/music/search":
 		io.WriteString(w, musicSearchSnooze)
+	case "/music/next":
+		io.WriteString(w, musicRadioSnooze)
 	case "/videoplayback":
 		w.WriteHeader(http.StatusPartialContent)
 		w.Write([]byte{0})
@@ -365,6 +387,137 @@ func TestSearch(t *testing.T) {
 	}
 	if q := api.body("/music/search")["query"]; q != "sza snooze" {
 		t.Errorf("query = %v", q)
+	}
+}
+
+func TestRadio(t *testing.T) {
+	yt, api := newFakeAPI(t, playerSnooze)
+	found, err := yt.Radio(context.Background(), "ZqSlV5LmrTg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var titles []string
+	for _, s := range found {
+		titles = append(titles, s.Title)
+	}
+	if got := strings.Join(titles, ", "); got != "Snooze, Kill Bill, Stuck with U, Me & U, Saturn" {
+		t.Fatalf("radio = %s, want the song itself first, then the rest, the wrapped one's own version and no unplayable ones", got)
+	}
+	s := found[2]
+	if s.ID != "yEA3qaB0dH8" || s.Link != songs.WatchLink("yEA3qaB0dH8") || s.Artist != "Justin Bieber & Ariana Grande" || s.Length != 229*time.Second {
+		t.Errorf("Stuck with U = %+v, want both artists and 3:49", s)
+	}
+	if !strings.HasSuffix(s.Thumbnail, "=w544-h544-l90-rj") {
+		t.Errorf("Thumbnail = %q, want the 544 px cover", s.Thumbnail)
+	}
+	if s.Audio.URL != "" {
+		t.Errorf("a radio's song has audio %q, want none until it's looked up", s.Audio.URL)
+	}
+	if found[4].ID != "i4YmKvw6mCY" {
+		t.Errorf("the wrapped song is %q, want the song rather than its video", found[4].ID)
+	}
+	if c := api.client("/music/next"); c != "WEB_REMIX" {
+		t.Errorf("clientName = %v, want WEB_REMIX", c)
+	}
+	body := api.body("/music/next")
+	if body["videoId"] != "ZqSlV5LmrTg" || body["playlistId"] != "RDAMVMZqSlV5LmrTg" {
+		t.Errorf("asked for video %v in playlist %v, want Snooze's radio", body["videoId"], body["playlistId"])
+	}
+}
+
+// wholeRadio is YouTube Music's whole answer for Snooze's radio, saved on
+// 2026-10-24: 566 KB, with the asker's visitor ID taken out and the tracking
+// tokens blanked, at the same length, so it decodes as the real one did.
+func wholeRadio(tb testing.TB) []byte {
+	tb.Helper()
+	f, err := os.Open("testdata/radio-snooze.json.gz")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	data, err := io.ReadAll(zr)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return data
+}
+
+func TestRadioFromAWholeAnswer(t *testing.T) {
+	var out musicRadio
+	if err := decode(strings.NewReader(string(wholeRadio(t))), &out); err != nil {
+		t.Fatal(err)
+	}
+	found := out.songs()
+	if len(found) != 50 || found[0].Title != "Snooze" || found[1].Title != "Kill Bill" {
+		t.Fatalf("got %d songs, starting %q; want 50, Snooze, then Kill Bill", len(found), found[0].Title)
+	}
+	for _, s := range found {
+		if s.ID == "" || s.Title == "" || s.Artist == "" || s.Length == 0 || !strings.HasPrefix(s.Thumbnail, "https://yt3.googleusercontent.com/") {
+			t.Errorf("a song with something missing: %+v", s)
+		}
+	}
+}
+
+// pieces hands out an answer 32 KB at a time, the way it comes from YouTube.
+type pieces []byte
+
+func (p *pieces) Read(b []byte) (int, error) {
+	if len(*p) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(b[:min(len(b), 32<<10)], *p)
+	*p = (*p)[n:]
+	return n, nil
+}
+
+// BenchmarkDecode reads a radio's whole answer and finds its songs, as the
+// API's answers are read, and as they were before v0.3.0, with a
+// json.Decoder. BENCHMARKS.md has the Pi's numbers.
+func BenchmarkDecode(b *testing.B) {
+	data := wholeRadio(b)
+	for _, read := range []struct {
+		name   string
+		decode func(io.Reader, any) error
+	}{
+		{"decode", decode},
+		{"json.Decoder", func(r io.Reader, out any) error { return json.NewDecoder(io.LimitReader(r, maxBody)).Decode(out) }},
+	} {
+		b.Run(read.name, func(b *testing.B) {
+			b.SetBytes(int64(len(data)))
+			b.ReportAllocs()
+			for b.Loop() {
+				answer := pieces(data)
+				var out musicRadio
+				if err := read.decode(&answer, &out); err != nil {
+					b.Fatal(err)
+				}
+				out.songs()
+			}
+		})
+	}
+}
+
+func TestDecode(t *testing.T) {
+	var out struct{ Title string }
+	for range 3 { // a kept buffer, used again
+		if err := decode(strings.NewReader(`{"title": "Snooze"}`), &out); err != nil || out.Title != "Snooze" {
+			t.Fatalf("decode = %q, %v", out.Title, err)
+		}
+	}
+	// Over maxBody fails, even when what fits would decode.
+	huge := `{"title": "Snooze"}` + strings.Repeat(" ", maxBody)
+	if err := decode(strings.NewReader(huge), &out); err == nil {
+		t.Error("decoded an answer bigger than maxBody")
+	}
+	if err := decode(strings.NewReader(huge[:maxBody]), &out); err != nil {
+		t.Errorf("an answer of exactly maxBody: %v", err)
+	}
+	if err := decode(strings.NewReader(`{"title": "Kill Bill"}`), &out); err != nil || out.Title != "Kill Bill" {
+		t.Errorf("after a huge answer, decode = %q, %v", out.Title, err)
 	}
 }
 

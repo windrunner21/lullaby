@@ -42,7 +42,7 @@ const (
 	warmVideo = "dQw4w9WgXcQ"
 	// timeout is how long one request to the API may take.
 	timeout = 10 * time.Second
-	// maxBody is far more than the biggest answer, a search at about 200 KB.
+	// maxBody is far more than the biggest answer, a radio at about 570 KB.
 	maxBody = 8 << 20
 )
 
@@ -159,6 +159,23 @@ func (y *YouTube) Search(ctx context.Context, query string) ([]songs.Song, error
 	return out.songs(), nil
 }
 
+// Radio finds YouTube Music's radio for the song with the given video ID:
+// the songs its app plays after it, about 50, the song itself first. Like a
+// search's, they have no audio yet.
+func (y *YouTube) Radio(ctx context.Context, id string) ([]songs.Song, error) {
+	body := map[string]any{
+		"context":     map[string]any{"client": map[string]any{"clientName": "WEB_REMIX", "clientVersion": musicVersion}},
+		"videoId":     id,
+		"playlistId":  "RDAMVM" + id,
+		"isAudioOnly": true,
+	}
+	var out musicRadio
+	if err := y.do(ctx, y.musicBase, "next", browserAgent, y.visitorID(ctx), body, &out); err != nil {
+		return nil, err
+	}
+	return out.songs(), nil
+}
+
 // visitorID returns a visitor ID for YouTube. The first request waits for
 // the first one, which Warm gets at startup. After that, a new one comes
 // every 10 minutes in the background, and requests use the one before it
@@ -232,10 +249,39 @@ func (y *YouTube) do(ctx context.Context, base, endpoint, agent, visitor string,
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("youtube %s: %s", endpoint, resp.Status)
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBody)).Decode(out); err != nil {
+	if err := decode(resp.Body, out); err != nil {
 		return fmt.Errorf("youtube %s: decode: %w", endpoint, err)
 	}
 	return nil
+}
+
+// answers are buffers for reading the API's answers whole, kept between
+// requests. json.Decoder grows a buffer of its own for every answer: on the
+// Pi, a radio's 566 KB took about 6 ms and made 2.2 MB of garbage that way,
+// and 3.8 ms and 0.16 MB from a kept buffer (BenchmarkDecode).
+var answers = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+// maxAnswerKept is the biggest buffer kept for the next answer.
+const maxAnswerKept = 2 << 20
+
+// decode reads an answer and decodes it into out. One over maxBody fails,
+// rather than being read in part.
+func decode(r io.Reader, out any) error {
+	buf := answers.Get().(*bytes.Buffer)
+	defer func() {
+		if buf.Cap() <= maxAnswerKept {
+			answers.Put(buf)
+		}
+	}()
+	buf.Reset()
+	n, err := buf.ReadFrom(io.LimitReader(r, maxBody+1))
+	if err != nil {
+		return err
+	}
+	if n > maxBody {
+		return fmt.Errorf("an answer over %d bytes", maxBody)
+	}
+	return json.Unmarshal(buf.Bytes(), out)
 }
 
 type thumbnail struct {
@@ -442,6 +488,110 @@ func (m musicItem) column(i int) string {
 	var b strings.Builder
 	for _, r := range m.FlexColumns[i].Column.Text.Runs {
 		b.WriteString(r.Text)
+	}
+	return b.String()
+}
+
+// musicRadio is the part of YouTube Music's answer for a radio that's used:
+// the songs in its queue.
+type musicRadio struct {
+	Contents struct {
+		Watch struct {
+			Tabbed struct {
+				Watch struct {
+					Tabs []struct {
+						TabRenderer struct {
+							Content struct {
+								Queue struct {
+									Content struct {
+										Panel struct {
+											Contents []radioItem `json:"contents"`
+										} `json:"playlistPanelRenderer"`
+									} `json:"content"`
+								} `json:"musicQueueRenderer"`
+							} `json:"content"`
+						} `json:"tabRenderer"`
+					} `json:"tabs"`
+				} `json:"watchNextTabbedResultsRenderer"`
+			} `json:"tabbedRenderer"`
+		} `json:"singleColumnMusicWatchNextResultsRenderer"`
+	} `json:"contents"`
+}
+
+func (r musicRadio) songs() []songs.Song {
+	n := 0
+	for _, tab := range r.Contents.Watch.Tabbed.Watch.Tabs {
+		n += len(tab.TabRenderer.Content.Queue.Content.Panel.Contents)
+	}
+	songs := make([]songs.Song, 0, n) // radios are kept for a while: no room to spare
+	for _, tab := range r.Contents.Watch.Tabbed.Watch.Tabs {
+		for _, item := range tab.TabRenderer.Content.Queue.Content.Panel.Contents {
+			v := item.Song
+			if item.Wrapped != nil {
+				v = item.Wrapped.Primary.Song
+			}
+			if v == nil {
+				continue
+			}
+			if song, ok := v.song(); ok {
+				songs = append(songs, song)
+			}
+		}
+	}
+	return songs
+}
+
+// radioItem is one song in a radio. A song that has a music video too comes
+// wrapped, as ytmusicapi reads it, with the version that plays first.
+type radioItem struct {
+	Song    *radioSong `json:"playlistPanelVideoRenderer"`
+	Wrapped *struct {
+		Primary struct {
+			Song *radioSong `json:"playlistPanelVideoRenderer"`
+		} `json:"primaryRenderer"`
+	} `json:"playlistPanelVideoWrapperRenderer"`
+}
+
+type radioSong struct {
+	VideoID string `json:"videoId"`
+	Title   runs   `json:"title"`
+	// Artist is who made it, like "Justin Bieber & Ariana Grande"; the long
+	// byline adds the album and year, or a video's views.
+	Artist    runs `json:"shortBylineText"`
+	Length    runs `json:"lengthText"`
+	Thumbnail struct {
+		Thumbnails []thumbnail `json:"thumbnails"`
+	} `json:"thumbnail"`
+	// Unplayable says why a song won't play here, like one taken down or
+	// blocked in the country.
+	Unplayable runs `json:"unplayableText"`
+}
+
+func (s radioSong) song() (songs.Song, bool) {
+	if _, ok := songs.YouTubeID(songs.WatchLink(s.VideoID)); !ok || len(s.Unplayable.Runs) > 0 {
+		return songs.Song{}, false
+	}
+	return songs.Song{
+		ID:        s.VideoID,
+		Link:      songs.WatchLink(s.VideoID),
+		Title:     s.Title.String(),
+		Artist:    s.Artist.String(),
+		Length:    parseLength(s.Length.String()),
+		Thumbnail: largest(s.Thumbnail.Thumbnails),
+	}, true
+}
+
+// runs is how YouTube Music writes text: in pieces, some of them links.
+type runs struct {
+	Runs []struct {
+		Text string `json:"text"`
+	} `json:"runs"`
+}
+
+func (r runs) String() string {
+	var b strings.Builder
+	for _, run := range r.Runs {
+		b.WriteString(run.Text)
 	}
 	return b.String()
 }

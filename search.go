@@ -4,6 +4,8 @@ import (
 	"cmp"
 	"context"
 	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -154,23 +156,32 @@ func (e *Engine) SuggestFor(ctx context.Context, r SuggestRequest) []songs.Song 
 	return out
 }
 
-// remember keeps suggestions for a while, and forgets old ones.
+// remember keeps suggestions, and a radio's songs, for a while. When there
+// are too many, old ones are forgotten first, then the ones remembered
+// longest ago, a tenth more than needed so this doesn't happen every time:
+// a radio's 49 songs push out the oldest choices, not all of them.
 func (e *Engine) remember(found []songs.Song) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := time.Now()
-	if len(e.suggested)+len(found) > maxSuggested {
-		for link, s := range e.suggested {
-			if now.Sub(s.at) > suggestedFor {
-				delete(e.suggested, link)
-			}
-		}
-	}
-	if len(e.suggested)+len(found) > maxSuggested {
-		clear(e.suggested)
-	}
 	for _, s := range found {
 		e.suggested[s.Link] = suggestion{song: s, at: now}
+	}
+	if len(e.suggested) <= maxSuggested {
+		return
+	}
+	for link, s := range e.suggested {
+		if now.Sub(s.at) > suggestedFor {
+			delete(e.suggested, link)
+		}
+	}
+	if over := len(e.suggested) - maxSuggested; over > 0 {
+		links := slices.SortedFunc(maps.Keys(e.suggested), func(a, b string) int {
+			return e.suggested[a].at.Compare(e.suggested[b].at)
+		})
+		for _, link := range links[:min(over+maxSuggested/10, len(links))] {
+			delete(e.suggested, link)
+		}
 	}
 }
 

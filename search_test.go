@@ -48,6 +48,63 @@ func TestRemembersSuggestions(t *testing.T) {
 	}
 }
 
+func TestRememberMakesRoom(t *testing.T) {
+	e := &Engine{suggested: make(map[string]suggestion)}
+	now := time.Now()
+	link := func(i int) string { return fmt.Sprint("https://www.youtube.com/watch?v=", i) }
+	// 452 suggestions from the last few minutes, the newest last.
+	for i := range 452 {
+		e.suggested[link(i)] = suggestion{song: songs.Song{Link: link(i)}, at: now.Add(-time.Duration(452-i) * time.Second)}
+	}
+	var radio []songs.Song
+	for i := range 49 {
+		radio = append(radio, songs.Song{Link: link(1000 + i)})
+	}
+	e.remember(radio)
+	if len(e.suggested) > maxSuggested {
+		t.Errorf("remembering %d, want at most %d", len(e.suggested), maxSuggested)
+	}
+	for _, i := range []int{1000, 1048, 451, 400} {
+		if _, ok := e.recall(link(i)); !ok {
+			t.Errorf("forgot %s, one of the radio's or a recent suggestion", link(i))
+		}
+	}
+	if _, ok := e.recall(link(0)); ok {
+		t.Error("kept the suggestion remembered longest ago")
+	}
+
+	// The same radio again adds nothing, so nothing is forgotten for it.
+	before := len(e.suggested)
+	e.remember(radio)
+	if len(e.suggested) != before {
+		t.Errorf("remembering songs it had already: %d remembered, want %d", len(e.suggested), before)
+	}
+
+	// Full, with old ones among the songs coming again, and the same song
+	// twice: what's left fits, and nothing new is forgotten.
+	clear(e.suggested)
+	for i := range maxSuggested {
+		at := now.Add(-time.Duration(maxSuggested-i) * time.Second)
+		if i < 48 {
+			at = now.Add(-suggestedFor - time.Minute)
+		}
+		e.suggested[link(i)] = suggestion{song: songs.Song{Link: link(i)}, at: at}
+	}
+	again := []songs.Song{{Link: link(2000)}, {Link: link(2000)}}
+	for i := range 48 {
+		again = append(again, songs.Song{Link: link(i)})
+	}
+	e.remember(again)
+	if len(e.suggested) > maxSuggested {
+		t.Errorf("remembering %d, want at most %d", len(e.suggested), maxSuggested)
+	}
+	for _, i := range []int{0, 47, 2000} {
+		if _, ok := e.recall(link(i)); !ok {
+			t.Errorf("forgot %s, which was just remembered", link(i))
+		}
+	}
+}
+
 func TestSearchMemory(t *testing.T) {
 	e := &Engine{searched: make(map[string]search), searching: make(map[string]*searching)}
 	sza := func(title string) songs.Song { return songs.Song{Title: title, Artist: "SZA"} }

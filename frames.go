@@ -48,6 +48,30 @@ func (f *frames) queue(next opus) {
 	f.next = next
 }
 
+// requeue is queue, and returns the song playing at that moment: one that
+// took over a moment before is playing, and the song next in line before
+// can't take over after.
+func (f *frames) requeue(next opus) opus {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.next = next
+	return f.song
+}
+
+// unqueue keeps song from taking over next, unless it has already. It
+// reports whether song isn't playing.
+func (f *frames) unqueue(song opus) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.song == song {
+		return false
+	}
+	if f.next == song {
+		f.next = nil
+	}
+	return true
+}
+
 // pause holds the song where it is, or lets it go on.
 func (f *frames) pause(paused bool) {
 	f.mu.Lock()

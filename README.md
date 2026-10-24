@@ -18,6 +18,7 @@ lullaby runs in Rem's Little Helper, a Discord bot, on a Raspberry Pi 5, and was
 - **Songs from a name or a link.** A name is searched on YouTube Music. Links can be from YouTube, SoundCloud, Spotify, Apple Music, Deezer or Yandex Music. The last four don't give bots their songs, so lullaby reads the song's name, artists and length there, and plays the same song from YouTube Music, with the original's cover.
 - **Suggestions while someone types:** from memory, from an earlier search narrowed down to the words typed since, or from YouTube Music. Searches can be remembered for as long as you like, so a song typed again is suggested at once. Once they stop typing, the engine tries to look the first song up, within a budget, so picking it or pressing Enter can play it at once. Picking one plays it with YouTube Music's title, artist and cover.
 - **A queue in every server, without gaps.** The next song is ready, with its ffmpeg running, before the one playing ends, and takes over in the same 20 ms. A song can go to the front of the queue. Pause, skip and stop act at once.
+- **Songs like this one.** `Radio` gives YouTube Music's radio for a song, about 50 songs its app plays after it, for a bot that keeps the music going when the queue runs out. A pick queued with `Request.Autoplay` waits behind the songs people ask for, and plays without a gap like any other.
 - **Ready before Enter.** While someone is still typing, lullaby can join their voice channel, warm up the connection to YouTube, start an ffmpeg and look up a pasted link.
 - **A backup.** With [yt-dlp](https://github.com/yt-dlp/yt-dlp), links from other sites play too, and yt-dlp takes over when YouTube or SoundCloud change something. During a YouTube bot check, it can sign in with a spare account.
 - **Encrypted voice.** Discord requires DAVE, which lullaby gets from [dave-go](https://github.com/thomas-vilte/dave-go), in pure Go, so your bot stays one static binary.
@@ -100,15 +101,17 @@ track, place, err := music.Play(ctx, lullaby.Request{GuildID: guildID, ChannelID
 | `SuggestFor(ctx, SuggestRequest{GuildID, UserID, Query})` | Songs for autocomplete, at most `MaxSuggestions`. Once that person stops typing, the first is looked up if the budget allows. A link gets none, and is looked up ahead instead |
 | `Suggest(ctx, words)` | `SuggestFor` without saying who's typing, so everyone's keystrokes replace each other's early lookups |
 | `JoinEarly`, `GetReady` | Get ready for someone typing: join their channel, warm up YouTube, start an ffmpeg |
+| `Radio(ctx, song)` | YouTube Music's radio for a song: about 50 songs to pick from when your bot chooses what plays next. Remembered like searches. A song without a YouTube video, like SoundCloud's, has none: `ErrNoRadio` |
 | `Pause`, `Skip`, `Stop`, `StopSong` | Control the music. `StopSong` stops only while a given song plays, so an old song's buttons can't stop a newer one |
-| `Playing`, `UpNext`, `Channel` | What's playing, what's next and how many after it, and where |
+| `Remove(guildID, track)` | Takes a song out of the queue before its turn, like a pick that's no longer wanted. A song that has started isn't removed |
+| `Playing`, `UpNext`, `UpNextTrack`, `Channel` | What's playing, what's next and how many after it, and where. `UpNextTrack` gives the next song's `Track`, for its `Meta` |
 | `Moved`, `Disconnected` | Pass on the bot's own voice state changes, when someone moves it or disconnects it |
 
-A `Track` is one song: `Song()` gives its title, artist, length and link, `Played()` how far it has played, `Cover()` its best picture, and `Meta` whatever your bot gave `Request.Meta`, like who asked and where.
+A `Track` is one song: `Song()` gives its title, artist, length and link, `Played()` how far it has played, `Cover()` its best picture, `Autoplay()` whether your bot chose it by itself, and `Meta` whatever your bot gave `Request.Meta`, like who asked and where. Songs asked for without `Next` go ahead of the ones queued with `Request.Autoplay`.
 
-Your `Events` hear what happens: `Started` when a song from the queue starts by itself, `Ended` when one is over by itself or skipped (with who skipped it, or why it broke off), `Left` when the engine leaves voice by itself, after nothing played or a song stayed paused for a while, and `QueueChanged` when a song that won't start is passed over. A song you stop isn't told about: `Stop` and `Disconnected` return it. The engine never calls events while holding its own lock, so they may call it back, and your bot may call the engine while holding a lock its events take. They can run at the same time, for different servers or for one.
+Your `Events` hear what happens: `Started` when a song from the queue starts by itself, `Ended` when one is over by itself or skipped (with who skipped it, or why it broke off), `Left` when the engine leaves voice by itself, after nothing played or a song stayed paused for a while, and `QueueChanged` when a song that won't start is passed over. A song you stop isn't told about: `Stop` and `Disconnected` return it. The engine never calls events while holding its own lock, so they may call it back, and your bot may call the engine while holding a lock its events take. They can run at the same time, for different servers or for one, and in no set order: a song that breaks off as soon as it starts can be `Ended` before it's `Started`. `Playing` says what plays now.
 
-What the engine hands you is yours: `Song()`, `UpNext`, `Suggest` and `SuggestFor` return copies. Errors and logs have the links in them redacted, since a link's query can hold a token.
+What the engine hands you is yours: `Song()`, `UpNext`, `Suggest`, `SuggestFor` and `Radio` return copies. Errors and logs have the links in them redacted, since a link's query can hold a token.
 
 The engine leaves a channel 2 minutes after the music stops, 30 seconds after `JoinEarly` if no song comes, and after a song has been paused for 10 minutes. A queue holds up to `MaxQueue` (100) songs.
 
@@ -126,7 +129,7 @@ The engine leaves a channel 2 minutes after the music stops, 30 seconds after `J
 | `Cache` | where yt-dlp keeps what it learned about YouTube's JavaScript | yt-dlp's own |
 | `Cookies` | a spare YouTube account's `cookies.txt`, for bot checks; needs `YTDLP` | never signing in |
 | `AllowPrivateLinks` | let songs come from the bot host's own network, like a music server at home; see below | off |
-| `SearchMemory` | how long a search is reused for the same words, up to 1000 searches; one that found nothing is believed for a minute at most. A day suits friends who play the same songs again, though a day-old search may miss a new release | 10 minutes |
+| `SearchMemory` | how long a search is reused for the same words, up to 1000 searches; one that found nothing is believed for a minute at most. A day suits friends who play the same songs again, though a day-old search may miss a new release. Radios are kept as long, up to 200 | 10 minutes |
 
 ### Errors
 
@@ -144,6 +147,8 @@ The engine leaves a channel 2 minutes after the music stops, 30 seconds after `J
 | `songs.ErrNoYTDLP` | a link from another site, without yt-dlp |
 | `songs.ErrNoAudio` | YouTube gave no plain audio link for the song, and there's no yt-dlp to try instead |
 | `songs.ErrBotCheck` | YouTube wants a sign-in to prove the bot isn't a bot; see below |
+
+`Radio` fails with `lullaby.ErrNoRadio` for a song without a YouTube video, like SoundCloud's.
 
 ### Packages
 
